@@ -1,4 +1,4 @@
-from aiogram import Router, types
+from aiogram import Router, types, F
 from aiogram.filters import Command
 from datetime import datetime, timedelta
 from sqlalchemy import select
@@ -16,6 +16,9 @@ logger = setup_logger(__name__, settings.LOG_LEVEL)
 
 @router.message(Command("start"))
 async def cmd_start(message: types.Message):
+    if not message.from_user:
+        return
+
     async with async_session() as session:
         result = await session.execute(
             select(User).where(User.chat_id == message.from_user.id)
@@ -27,21 +30,21 @@ async def cmd_start(message: types.Message):
             session.add(new_user)
             await session.commit()
             await message.answer(
-                f"👋 Вітаю!\n\n"
+                "👋 Вітаю!\n\n"
                 f"🏘 Ваша група: **{settings.DEFAULT_GROUP}**\n\n"
-                f"Використовуйте кнопки нижче або команди:\n"
-                f"• /today - графік на сьогодні\n"
-                f"• /tomorrow - графік на завтра\n"
+                "Використовуйте кнопки нижче або команди:\n"
+                "• /today - графік на сьогодні\n"
+                "• /tomorrow - графік на завтра\n"
                 "Також ви можете просто написати сьогодні або завтра\n",
                 reply_markup=get_main_keyboard(),
-                parse_mode="Markdown"
+                parse_mode="Markdown",
             )
         else:
             await message.answer(
-                f"З поверненням! 👋\n\n"
-                f"Використовуйте кнопки або просто напишіть **сьогодні** або **завтра**",
+                "З поверненням! 👋\n\n"
+                "Використовуйте кнопки або просто напишіть **сьогодні** або **завтра**",
                 reply_markup=get_main_keyboard(),
-                parse_mode="Markdown"
+                parse_mode="Markdown",
             )
 
 
@@ -58,12 +61,15 @@ async def cmd_help(message: types.Message):
         "🔴 Немає світла\n"
         "🟡 Перемикання\n\n"
         "💡 Графіки оновлюються автоматично кожні 10 хвилин",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
 
 
 @router.message(Command("today"))
 async def get_today_schedule(message: types.Message):
+    if not message.from_user:
+        return
+
     service = PowerService()
     text, _ = await service.get_formatted_schedule(message.from_user.id, datetime.now())
     await message.answer(text, parse_mode="Markdown")
@@ -71,22 +77,25 @@ async def get_today_schedule(message: types.Message):
 
 @router.message(Command("tomorrow"))
 async def get_tomorrow_schedule(message: types.Message):
+    if not message.from_user:
+        return
+
     service = PowerService()
     tomorrow = datetime.now() + timedelta(days=1)
     text, _ = await service.get_formatted_schedule(message.from_user.id, tomorrow)
     await message.answer(text, parse_mode="Markdown")
 
 
-@router.message(lambda msg: msg.text and msg.text.lower() in ["допомога", "help"])
-async def button_today(message: types.Message):
+@router.message(F.text.lower().in_(["допомога", "help"]))
+async def text_help(message: types.Message):
     await cmd_help(message)
 
 
-@router.message(lambda msg: msg.text and msg.text.lower() in ["📅 сьогодні", "сьогодні"])
-async def button_today(message: types.Message):
+@router.message(F.text.lower().in_(["📅 сьогодні", "сьогодні"]))
+async def text_today(message: types.Message):
     await get_today_schedule(message)
 
 
-@router.message(lambda msg: msg.text and msg.text.lower() in ["🔜 завтра", "завтра"])
-async def button_tomorrow(message: types.Message):
+@router.message(F.text.lower().in_(["🔜 завтра", "завтра"]))
+async def text_tomorrow(message: types.Message):
     await get_tomorrow_schedule(message)

@@ -1,13 +1,13 @@
 import time
 from typing import Any, Awaitable, Callable, Dict
 from aiogram import BaseMiddleware
-from aiogram.types import Message
+from aiogram.types import TelegramObject, Message
 
 
 class AntiFloodMiddleware(BaseMiddleware):
     def __init__(self, limit: int = 10, window: int = 10, ban_time: int = 300):
-        self.users = {}
-        self.banned_users = {}
+        self.users: Dict[int, list[float]] = {}
+        self.banned_users: Dict[int, float] = {}
         self.limit = limit
         self.window = window
         self.ban_time = ban_time
@@ -15,10 +15,13 @@ class AntiFloodMiddleware(BaseMiddleware):
 
     async def __call__(
             self,
-            handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
-            event: Message,
+            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            event: TelegramObject,
             data: Dict[str, Any]
     ) -> Any:
+        if not isinstance(event, Message) or not event.from_user:
+            return await handler(event, data)
+
         user_id = event.from_user.id
         now = time.time()
 
@@ -37,7 +40,10 @@ class AntiFloodMiddleware(BaseMiddleware):
 
         if len(self.users[user_id]) > self.limit:
             self.banned_users[user_id] = now + self.ban_time
-            await event.answer(f"❌ **Ви заблоковані на {self.ban_time // 60} хв за спам!**", parse_mode="Markdown")
+            await event.answer(
+                f"❌ **Ви заблоковані на {self.ban_time // 60} хв за спам!**",
+                parse_mode="Markdown",
+            )
             return None
 
         return await handler(event, data)
