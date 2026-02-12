@@ -4,12 +4,11 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 
 from src.config import settings
+from src.logger import setup_logger
 from src.database.engine import async_session
 from src.database.models import User
 from src.poweron.service import PowerService
-from src.poweron.utils import format_schedule, format_date_ua, get_current_status
 from src.telegram.utils import get_main_keyboard
-from src.logger import setup_logger
 
 router = Router()
 logger = setup_logger(__name__, settings.LOG_LEVEL)
@@ -32,15 +31,17 @@ async def cmd_start(message: types.Message):
                 f"🏘 Ваша група: **{settings.DEFAULT_GROUP}**\n\n"
                 f"Використовуйте кнопки нижче або команди:\n"
                 f"• /today - графік на сьогодні\n"
-                f"• /tomorrow - графік на завтра\n",
+                f"• /tomorrow - графік на завтра\n"
+                "Також ви можете просто написати сьогодні або завтра\n",
                 reply_markup=get_main_keyboard(),
                 parse_mode="Markdown"
             )
         else:
             await message.answer(
                 f"З поверненням! 👋\n\n"
-                f"Використовуйте кнопки або просто напишіть сьогодні або завтра",
-                reply_markup=get_main_keyboard()
+                f"Використовуйте кнопки або просто напишіть **сьогодні** або **завтра**",
+                reply_markup=get_main_keyboard(),
+                parse_mode="Markdown"
             )
 
 
@@ -51,8 +52,7 @@ async def cmd_help(message: types.Message):
         "**Доступні команди:**\n"
         "• /today - графік на сьогодні\n"
         "• /tomorrow - графік на завтра\n"
-        "• /start - перезапустити бота\n\n"
-        "Також ви можете просто написати сьогодні або завтра\n\n"
+        "Також ви можете просто написати **сьогодні** або **завтра**\n\n"
         "**Позначення:**\n"
         "🟢 Світло є\n"
         "🔴 Немає світла\n"
@@ -62,74 +62,19 @@ async def cmd_help(message: types.Message):
     )
 
 
-async def send_schedule(message: types.Message, date: datetime, date_str: str):
-    try:
-        service = PowerService()
-        date_display = format_date_ua(date)
-
-        async with async_session() as session:
-            result = await session.execute(
-                select(User).where(User.chat_id == message.from_user.id)
-            )
-            user = result.scalar_one_or_none()
-            user_group = user.group if user else settings.DEFAULT_GROUP
-
-        cached_times = await service.get_schedule_from_cache(date_str, user_group)
-
-        # if not cached_times:
-        #     logger.info(f"No cache for {date_str}, trying to fetch from API...")
-        #     await service.get_schedule()
-        #     cached_times = await service.get_schedule_from_cache(date_str, user_group)
-
-        if cached_times:
-            readable_text = format_schedule(cached_times)
-
-            current_status_text = ""
-            now = datetime.now()
-
-            if date.date() == now.date():
-                current_status = get_current_status(cached_times)
-                if current_status:
-                    current_status_text = f"⚡️ **Зараз:** {current_status}\n"
-
-            caption = (
-                f"📅 **Графік на {date_display}**\n"
-                f"🏘 Група: **{user_group}**\n"
-                f"{current_status_text}"
-                f"⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
-                f"{readable_text}\n"
-                f"⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
-                f"💡 _Оновлено о {now.strftime('%H:%M')}_"
-            )
-
-            await message.answer(caption, parse_mode="Markdown")
-        else:
-            await message.answer(
-                f"❌ Графік на **{date_display}** ще не опублікований\n\n"
-                f"Спробуйте пізніше або зачекайте автоматичного оновлення",
-                parse_mode="Markdown"
-            )
-
-    except Exception as e:
-        logger.error(f"Error in send_schedule for {date_str}: {e}")
-        await message.answer(
-            "❌ Помилка при отриманні графіка\n\n"
-            "Спробуйте ще раз за кілька хвилин"
-        )
-
-
 @router.message(Command("today"))
 async def get_today_schedule(message: types.Message):
-    today = datetime.now()
-    today_date = today.strftime("%Y-%m-%d")
-    await send_schedule(message, today, today_date)
+    service = PowerService()
+    text, _ = await service.get_formatted_schedule(message.from_user.id, datetime.now())
+    await message.answer(text, parse_mode="Markdown")
 
 
 @router.message(Command("tomorrow"))
 async def get_tomorrow_schedule(message: types.Message):
+    service = PowerService()
     tomorrow = datetime.now() + timedelta(days=1)
-    tomorrow_date = tomorrow.strftime("%Y-%m-%d")
-    await send_schedule(message, tomorrow, tomorrow_date)
+    text, _ = await service.get_formatted_schedule(message.from_user.id, tomorrow)
+    await message.answer(text, parse_mode="Markdown")
 
 
 @router.message(lambda msg: msg.text and msg.text.lower() in ["допомога", "help"])

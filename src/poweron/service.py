@@ -3,12 +3,14 @@ import base64
 import json
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
+from zoneinfo import ZoneInfo
 
 from src.config import settings
 from src.logger import setup_logger
 from src.poweron.schemas import ScheduleResponse
 from src.database.engine import async_session
-from src.database.models import ScheduleCache
+from src.database.models import User, ScheduleCache
+from src.poweron.utils import format_schedule, format_date_ua, get_current_status
 
 logger = setup_logger(__name__, settings.LOG_LEVEL)
 
@@ -45,7 +47,7 @@ class PowerService:
 
                 if time_diff < 1800:
                     logger.info(f"Cache HIT for {date_str} (age: {int(time_diff)}s)")
-                    return json.loads(cache.times_json)
+                    return json.loads(cache.times_json), cache_time
                 else:
                     logger.info(f"Cache EXPIRED for {date_str} (age: {int(time_diff)}s)")
 
@@ -120,3 +122,46 @@ class PowerService:
             else:
                 logger.error(f"Error {response.status_code}: {response.text[:200]}")
                 return None
+
+    async def get_formatted_schedule(self, chat_id: int, date: datetime) -> tuple[str, bool]:
+        date_str = date.strftime("%Y-%m-%d")
+        date_display = format_date_ua(date)
+
+        async with async_session() as session:
+            result = await session.execute(select(User).where(User.chat_id == chat_id))
+            user = result.scalar_one_or_none()
+            user_group = user.group if user else settings.DEFAULT_GROUP
+
+        cached_times, updated_at = await self.get_schedule_from_cache(date_str, user_group)
+
+        # if not cached_times:
+        #     logger.info(f"Cache miss for {date_str}, fetching from API...")
+        #     await self.get_schedule(group=user_group)
+        #     cached_times, updated_at = await self.get_schedule_from_cache(date_str, user_group)
+
+        if not cached_times:
+            return f"❌ **Графіка на {date_display} ще немає**", False
+
+        readable_text = format_schedule(cached_times)
+        current_status_text = ""
+        now = datetime.now()
+
+        if date.date() == now.date():
+            status = get_current_status(cached_times)
+            if status:
+                current_status_text = f"⚡️ **Зараз:** {status}\n"
+
+        kyiv_tz = ZoneInfo("Europe/Kyiv")
+        db_time_kyiv = updated_at.astimezone(kyiv_tz)
+
+        caption = (
+            f"📅 **Графік на {date_display}**\n"
+            f"🏘 Група: **{user_group}**\n"
+            f"{current_status_text}"
+            f"⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
+            f"{readable_text}\n"
+            f"⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
+            f"💡 _Оновлено о {db_time_kyiv.strftime('%H:%M')}_"
+        )
+
+        return caption, True
