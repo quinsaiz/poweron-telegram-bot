@@ -125,9 +125,7 @@ class PowerService:
 
                         if date_graph and group_info and target_group:
                             await self.save_schedule_to_cache(
-                                date_graph, 
-                                target_group,
-                                group_info.get("times", {})
+                                date_graph, target_group, group_info.get("times", {})
                             )
 
                     return ScheduleResponse(**json_data)

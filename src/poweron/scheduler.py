@@ -1,7 +1,11 @@
 import asyncio
 from datetime import datetime
 from aiogram import Bot
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramNotFound
+from aiogram.exceptions import (
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+    TelegramNotFound,
+)
 from sqlalchemy import select, delete
 
 from src.config import settings
@@ -29,7 +33,9 @@ async def send_notification(bot: Bot, date: datetime):
 
             if ok:
                 notification = f"🔔 **ОПУБЛІКОВАНО ОНОВЛЕННЯ!**\n\n{text}"
-                await bot.send_message(user.chat_id, notification, parse_mode="Markdown")
+                await bot.send_message(
+                    user.chat_id, notification, parse_mode="Markdown"
+                )
                 success_count += 1
 
             await asyncio.sleep(0.05)
@@ -75,12 +81,14 @@ async def check_updates_loop(bot: Bot):
 
                         logger.info(f"Initial state saved with ID: {new_id}")
                     elif new_id != state.last_id:
-                        logger.info(f"New schedule detected! Old ID: {state.last_id}, New ID: {new_id}")
+                        logger.info(
+                            f"New schedule detected! Old ID: {state.last_id}, New ID: {new_id}"
+                        )
 
                         state.last_id = new_id
                         await session.commit()
 
-                        date_str = latest_event.date_graph.split('T')[0]
+                        date_str = latest_event.date_graph.split("T")[0]
                         target_date = datetime.strptime(date_str, "%Y-%m-%d")
                         await send_notification(bot, target_date)
                     else:

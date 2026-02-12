@@ -30,6 +30,12 @@ class ScheduleCache(Base):
     group: Mapped[str] = mapped_column(String, default="3.2")
     times_json: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime,
-        default=lambda: datetime.now(timezone.utc)
+        DateTime, default=lambda: datetime.now(timezone.utc)
     )
+
+
+class BannedUser(Base):
+    __tablename__ = "banned_users"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    until_date: Mapped[datetime] = mapped_column(DateTime)
