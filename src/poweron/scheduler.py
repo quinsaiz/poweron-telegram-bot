@@ -51,7 +51,7 @@ async def send_notification(bot: Bot, date: datetime):
         except Exception as e:
             logger.error(f"Failed to send message {user.chat_id}: {e}")
 
-    logger.info(f"✅ Sending completed. Successfully: {success_count}")
+    logger.info(f"Sending completed. Successfully: {success_count}")
 
 
 async def check_updates_loop(bot: Bot):
