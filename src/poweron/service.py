@@ -99,7 +99,7 @@ class PowerService:
             "time": settings.CITY_ID,
         }
 
-        logger.info("🌐 Making API request...")
+        logger.info("Making API request...")
 
         async with httpx.AsyncClient(
             headers=self.headers, follow_redirects=True, timeout=30.0
