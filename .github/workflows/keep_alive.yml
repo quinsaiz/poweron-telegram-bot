@@ -2,7 +2,7 @@ name: Keep Koyeb Alive
 
 on:
   schedule:
-    - cron: '*/40 * * * *'
+    - cron: "*/40 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -11,5 +11,7 @@ jobs:
     steps:
       - name: Ping Koyeb App
         run: |
-          curl -s -o /dev/null -w "%{http_code}" parliamentary-lesley-poweron-telegram-bot-a491d359.koyeb.app/
-          echo "Ping sent to Koyeb"
+          curl -s -L -X GET "https://parliamentary-lesley-poweron-telegram-bot-a491d359.koyeb.app/" \
+          -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 (Arch Linux)" \
+          -o /dev/null -w "%{http_code}"
+          echo -e "\nWake up call sent."
