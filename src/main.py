@@ -26,7 +26,7 @@ async def lifespan(_: FastAPI):
     logger.info("Starting bot services...")
     await init_db()
 
-    polling_task = asyncio.create_task(dp.start_polling(bot))
+    polling_task = asyncio.create_task(dp.start_polling(bot, drop_pending_updates=True))
     monitor_task = asyncio.create_task(check_updates_loop(bot))
 
     yield
