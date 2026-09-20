@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import AsyncIterator  # noqa: TC003  # runtime lifespan reflection
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -112,9 +113,11 @@ def _collect_worker_results(
             else:
                 _task_result(task, name, errors, cancelled=name in cancelled)
         else:
-            task.add_done_callback(
-                lambda finished, label=name: _log_late_task_result(finished, label)
-            )
+
+            def log_late_result(finished: asyncio.Task[Any], label: str = name) -> None:
+                _log_late_task_result(finished, label)
+
+            task.add_done_callback(log_late_result)
 
 
 async def _finish_workers(
@@ -174,7 +177,7 @@ async def _shutdown(
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     polling_task = None
     monitor_task = None
     try:
@@ -198,5 +201,5 @@ app = FastAPI(title="poweron-telegram-bot", lifespan=lifespan)
 
 
 @app.get("/")
-async def health_check():
+async def health_check() -> dict[str, str]:
     return {"status": "ok", "bot": "running"}

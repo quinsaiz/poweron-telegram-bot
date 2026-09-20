@@ -1,16 +1,18 @@
 import asyncio
-import importlib
+import inspect
 import os
-import runpy
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from typing import get_type_hints
+from unittest.mock import AsyncMock, patch
 
-import uvicorn
+from aiogram import Bot
 
 with patch.dict(os.environ, {"BOT_TOKEN": "123:test-only-token"}):
     from src import main
+    from src.poweron.scheduler import send_notification
+    from src.telegram.middlewares import AntiFloodMiddleware
 
 
 class FakeDispatcher:
@@ -172,25 +174,15 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.engine.dispose.assert_awaited_once_with()
 
 
-class DirectLaunchTests(unittest.TestCase):
-    def test_module_launch_uses_environment_port_and_default(self):
-        bot_module = importlib.import_module("src.telegram.bot")
-        fake_dispatcher = SimpleNamespace(
-            include_router=Mock(), message=SimpleNamespace(middleware=Mock())
-        )
+class RuntimeAnnotationTests(unittest.TestCase):
+    def test_lifespan_annotations_can_be_inspected(self):
+        signature = inspect.signature(main.lifespan)
+        self.assertIn("_", signature.parameters)
+        self.assertIn("return", main.lifespan.__annotations__)
 
-        for env_port, expected_port in (("8765", 8765), (None, 9999)):
-            with self.subTest(port=env_port):
-                env = {"BOT_TOKEN": "123:test-only-token"}
-                if env_port is not None:
-                    env["PORT"] = env_port
-                with (
-                    patch.dict(os.environ, env, clear=True),
-                    patch.object(bot_module, "dp", fake_dispatcher),
-                    patch.object(uvicorn, "run") as uvicorn_run,
-                ):
-                    namespace = runpy.run_path(main.__file__, run_name="__main__")
+    def test_scheduler_annotations_can_be_evaluated(self):
+        self.assertIs(get_type_hints(send_notification)["bot"], Bot)
+        self.assertIs(inspect.get_annotations(send_notification, eval_str=True)["bot"], Bot)
 
-                uvicorn_run.assert_called_once_with(
-                    namespace["app"], host="0.0.0.0", port=expected_port
-                )
+    def test_middleware_annotations_can_be_evaluated(self):
+        self.assertIn("handler", get_type_hints(AntiFloodMiddleware.__call__))

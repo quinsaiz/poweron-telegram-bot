@@ -1,7 +1,7 @@
 import json
 import os
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -47,8 +47,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
                     date_graph=date_str or self.date_str,
                     group=group,
                     times_json=json.dumps({"00:00": "0"}),
-                    updated_at=datetime.now(timezone.utc)
-                    - timedelta(minutes=age_minutes),
+                    updated_at=datetime.now(UTC) - timedelta(minutes=age_minutes),
                 )
             )
             await session.commit()
@@ -130,12 +129,8 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🔴 Немає світла", text)
         self.assertIn("🟡 Перемикання", text)
         self.assertEqual(len(self.requests), 1)
-        self.assertEqual(
-            self.requests[0].url.params["after"], "2024-01-14T12:00:00+00:00"
-        )
-        self.assertEqual(
-            self.requests[0].url.params["before"], "2024-01-16T12:00:00+00:00"
-        )
+        self.assertEqual(self.requests[0].url.params["after"], "2024-01-14T12:00:00+00:00")
+        self.assertEqual(self.requests[0].url.params["before"], "2024-01-16T12:00:00+00:00")
         async with self.session() as session:
             cache = (await session.execute(select(ScheduleCache))).scalar_one()
         self.assertEqual(json.loads(cache.times_json), {"00:00": "1", "12:30": "10"})
@@ -183,9 +178,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             patch.object(AsyncSession, "rollback", track_rollback),
             patch.object(self.service, "get_schedule_from_cache", check_lookup),
         ):
-            text, ok = await self.service.get_formatted_schedule(
-                self.chat_id, self.date
-            )
+            text, ok = await self.service.get_formatted_schedule(self.chat_id, self.date)
 
         self.assertTrue(ok)
         self.assertIn("🟢 Є світло", text)
@@ -206,9 +199,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             raise OperationalError("INSERT schedule_cache", {}, Exception("simulated"))
 
         with patch.object(AsyncSession, "commit", fail_commit):
-            text, ok = await self.service.get_formatted_schedule(
-                self.chat_id, self.date
-            )
+            text, ok = await self.service.get_formatted_schedule(self.chat_id, self.date)
 
         self.assertFalse(ok)
         self.assertEqual(text, "❌ **Графіка на 15 січня ще немає**")
@@ -269,9 +260,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             self.service, "save_schedule_to_cache", new_callable=AsyncMock
         ) as save_cache:
-            text, ok = await self.service.get_formatted_schedule(
-                self.chat_id, self.date
-            )
+            text, ok = await self.service.get_formatted_schedule(self.chat_id, self.date)
 
         self.assertTrue(ok)
         self.assertIn("🟢 Є світло", text)
@@ -317,47 +306,35 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
                     self.service, "get_schedule", new_callable=AsyncMock
                 ) as no_refresh:
                     no_refresh.return_value = None
-                    expected = await self.service.get_formatted_schedule(
-                        self.chat_id, self.date
-                    )
+                    expected = await self.service.get_formatted_schedule(self.chat_id, self.date)
                 self.assertTrue(expected[1])
                 self.assertIn("📅 **Графік на 15 січня**", expected[0])
                 self.assertIn("🏘 Група: **4.1**", expected[0])
                 self.assertIn("`00:00 — 24:00:` 🟢 Є світло", expected[0])
 
                 times = {"00:00": "1", key: "1"}
-                with self.isolated_api(times=times, group=target_group):
-                    with patch.object(
+                with (
+                    self.isolated_api(times=times, group=target_group),
+                    patch.object(
                         self.service, "save_schedule_to_cache", new_callable=AsyncMock
-                    ) as save_cache:
-                        save_cache.reset_mock()
-                        result = await self.service.get_schedule(
-                            group=target_group, date=self.date
-                        )
-                        self.assertIsNone(result)
-                        with patch.object(
-                            self.service, "get_schedule", new_callable=AsyncMock
-                        ) as no_refresh:
-                            no_refresh.return_value = None
-                            actual = await self.service.get_formatted_schedule(
-                                self.chat_id, self.date
-                            )
-                            no_refresh.assert_awaited_once_with(
-                                group=target_group, date=self.date
-                            )
-                        save_cache.assert_not_called()
+                    ) as save_cache,
+                ):
+                    save_cache.reset_mock()
+                    result = await self.service.get_schedule(group=target_group, date=self.date)
+                    self.assertIsNone(result)
+                    with patch.object(
+                        self.service, "get_schedule", new_callable=AsyncMock
+                    ) as no_refresh:
+                        no_refresh.return_value = None
+                        actual = await self.service.get_formatted_schedule(self.chat_id, self.date)
+                        no_refresh.assert_awaited_once_with(group=target_group, date=self.date)
+                    save_cache.assert_not_called()
 
                 self.assertEqual(len(self.requests), 1)
                 request = self.requests[0]
-                self.assertEqual(
-                    request.url.params["after"], "2024-01-14T12:00:00+00:00"
-                )
-                self.assertEqual(
-                    request.url.params["before"], "2024-01-16T12:00:00+00:00"
-                )
-                self.assertEqual(
-                    request.url.params["time"], str(service_module.settings.CITY_ID)
-                )
+                self.assertEqual(request.url.params["after"], "2024-01-14T12:00:00+00:00")
+                self.assertEqual(request.url.params["before"], "2024-01-16T12:00:00+00:00")
+                self.assertEqual(request.url.params["time"], str(service_module.settings.CITY_ID))
                 self.assertEqual(actual, expected)
                 async with self.session() as session:
                     stale = (
@@ -390,9 +367,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
                     await session.commit()
                 times = {key: "1"}
                 with self.isolated_api(times=times, group=target_group):
-                    text, ok = await self.service.get_formatted_schedule(
-                        self.chat_id, self.date
-                    )
+                    text, ok = await self.service.get_formatted_schedule(self.chat_id, self.date)
 
                 self.assertTrue(ok)
                 self.assertIn("🏘 Група: **4.1**", text)

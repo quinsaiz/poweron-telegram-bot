@@ -1,6 +1,7 @@
-from sqlalchemy import BigInteger, String, Integer, Text, DateTime
+from datetime import UTC, datetime
+
+from sqlalchemy import BigInteger, DateTime, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from datetime import datetime, timezone
 
 
 class Base(DeclarativeBase):
@@ -29,9 +30,7 @@ class ScheduleCache(Base):
     date_graph: Mapped[str] = mapped_column(String, unique=True)
     group: Mapped[str] = mapped_column(String, default="3.2")
     times_json: Mapped[str] = mapped_column(Text)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=lambda: datetime.now(timezone.utc)
-    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
 
 
 class BannedUser(Base):

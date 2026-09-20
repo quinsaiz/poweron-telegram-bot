@@ -1,7 +1,7 @@
 from datetime import datetime
 
 
-def format_schedule(times: dict) -> str:
+def format_schedule(times: dict[str, str]) -> str:
     if not times:
         return "⚠️ *Графік відсутній*"
 
@@ -29,7 +29,7 @@ def format_schedule(times: dict) -> str:
     return "\n".join(formatted_blocks)
 
 
-def get_current_status(times: dict) -> str:
+def get_current_status(times: dict[str, str]) -> str:
     if not times:
         return ""
 

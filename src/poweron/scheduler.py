@@ -1,23 +1,24 @@
 import asyncio
 from datetime import datetime
-from aiogram import Bot
+
+from aiogram import Bot  # noqa: TC002  # runtime scheduler annotation reflection
 from aiogram.exceptions import (
     TelegramForbiddenError,
-    TelegramRetryAfter,
     TelegramNotFound,
+    TelegramRetryAfter,
 )
-from sqlalchemy import select, delete
+from sqlalchemy import delete, select
 
 from src.config import settings
-from src.logger import setup_logger
 from src.database.engine import async_session
 from src.database.models import ScheduleState, User
+from src.logger import setup_logger
 from src.poweron.service import PowerService
 
 logger = setup_logger(__name__, settings.LOG_LEVEL)
 
 
-async def send_notification(bot: Bot, date: datetime):
+async def send_notification(bot: Bot, date: datetime) -> None:
     service = PowerService()
 
     async with async_session() as session:
@@ -33,14 +34,12 @@ async def send_notification(bot: Bot, date: datetime):
 
             if ok:
                 notification = f"🔔 **ОПУБЛІКОВАНО ОНОВЛЕННЯ!**\n\n{text}"
-                await bot.send_message(
-                    user.chat_id, notification, parse_mode="Markdown"
-                )
+                await bot.send_message(user.chat_id, notification, parse_mode="Markdown")
                 success_count += 1
 
             await asyncio.sleep(0.05)
 
-        except (TelegramForbiddenError, TelegramNotFound):
+        except TelegramForbiddenError, TelegramNotFound:
             async with async_session() as session:
                 await session.execute(delete(User).where(User.chat_id == user.chat_id))
                 await session.commit()
@@ -54,7 +53,7 @@ async def send_notification(bot: Bot, date: datetime):
     logger.info(f"Sending completed. Successfully: {success_count}")
 
 
-async def check_updates_loop(bot: Bot):
+async def check_updates_loop(bot: Bot) -> None:
     service = PowerService()
 
     while True:

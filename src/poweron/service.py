@@ -1,20 +1,21 @@
-import httpx
 import base64
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import httpx
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm.exc import StaleDataError
-from zoneinfo import ZoneInfo
 
 from src.config import settings
+from src.database.engine import async_session
+from src.database.models import ScheduleCache, User
 from src.logger import setup_logger
 from src.poweron.schemas import ScheduleResponse
-from src.database.engine import async_session
-from src.database.models import User, ScheduleCache
-from src.poweron.utils import format_schedule, format_date_ua, get_current_status
+from src.poweron.utils import format_date_ua, format_schedule, get_current_status
 
 logger = setup_logger(__name__, settings.LOG_LEVEL)
 TIME_PATTERN = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
@@ -22,7 +23,7 @@ VALID_STATUSES = {"0", "1", "10"}
 
 
 class PowerService:
-    def __init__(self):
+    def __init__(self) -> None:
         city_id_base64 = base64.b64encode(str(settings.CITY_ID).encode()).decode()
 
         self.base_url = settings.API_URL
@@ -36,7 +37,7 @@ class PowerService:
     @staticmethod
     async def get_schedule_from_cache(
         date_str: str, group: str = "3.2", allow_stale: bool = False
-    ):
+    ) -> tuple[dict[str, str] | None, datetime | None]:
         async with async_session() as session:
             result = await session.execute(
                 select(ScheduleCache).where(
@@ -48,19 +49,17 @@ class PowerService:
             if cache:
                 cache_time = cache.updated_at
                 if cache_time.tzinfo is None:
-                    cache_time = cache_time.replace(tzinfo=timezone.utc)
+                    cache_time = cache_time.replace(tzinfo=UTC)
 
-                time_diff = (datetime.now(timezone.utc) - cache_time).total_seconds()
+                time_diff = (datetime.now(UTC) - cache_time).total_seconds()
 
                 if time_diff >= 1800 and not allow_stale:
-                    logger.info(
-                        f"Cache EXPIRED for {date_str} (age: {int(time_diff)}s)"
-                    )
+                    logger.info(f"Cache EXPIRED for {date_str} (age: {int(time_diff)}s)")
                     return None, None
 
                 try:
                     times = json.loads(cache.times_json)
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     logger.warning(f"Invalid cached schedule for {date_str}, group {group}")
                     return None, None
 
@@ -73,7 +72,7 @@ class PowerService:
             return None, None
 
     @staticmethod
-    async def save_schedule_to_cache(date_str: str, group: str, times_dict: dict):
+    async def save_schedule_to_cache(date_str: str, group: str, times_dict: dict[str, str]) -> None:
         async with async_session() as session:
             try:
                 result = await session.execute(
@@ -85,18 +84,18 @@ class PowerService:
                 if cache:
                     cache.group = group
                     cache.times_json = times_json
-                    cache.updated_at = datetime.now(timezone.utc)
+                    cache.updated_at = datetime.now(UTC)
                 else:
                     session.add(
                         ScheduleCache(
                             date_graph=date_str,
                             group=group,
                             times_json=times_json,
-                            updated_at=datetime.now(timezone.utc),
+                            updated_at=datetime.now(UTC),
                         )
                     )
                 await session.commit()
-            except (DBAPIError, StaleDataError):
+            except DBAPIError, StaleDataError:
                 await session.rollback()
                 raise
 
@@ -112,25 +111,21 @@ class PowerService:
             for time, status in times.items()
         )
 
-    async def get_schedule(self, group: str | None = None, date: datetime | None = None):
+    async def get_schedule(
+        self, group: str | None = None, date: datetime | None = None
+    ) -> ScheduleResponse | None:
         target_group = group or settings.DEFAULT_GROUP
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if date is None:
-            after_dt = (now - timedelta(days=1)).replace(
-                hour=12, minute=0, second=0, microsecond=0
-            )
-            before_dt = (now + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
+            after_dt = (now - timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+            before_dt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         else:
-            requested_midnight = datetime.combine(
-                date.date(), datetime.min.time(), tzinfo=timezone.utc
-            )
+            requested_midnight = datetime.combine(date.date(), datetime.min.time(), tzinfo=UTC)
             after_dt = requested_midnight - timedelta(hours=12)
             before_dt = requested_midnight + timedelta(days=1, hours=12)
 
-        params = {
+        params: dict[str, str | int] = {
             "before": before_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
             "after": after_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
             "time": settings.CITY_ID,
@@ -149,7 +144,7 @@ class PowerService:
                     return None
 
                 requested_date = date.strftime("%Y-%m-%d") if date is not None else None
-                schedules_to_save = {}
+                schedules_to_save: dict[str, dict[str, str]] = {}
                 for event in schedule.events:
                     date_graph = event.date_graph.split("T")[0]
                     if requested_date is not None and date_graph != requested_date:
@@ -172,9 +167,7 @@ class PowerService:
                 logger.error(f"Error {response.status_code}: {response.text[:200]}")
                 return None
 
-    async def get_formatted_schedule(
-        self, chat_id: int, date: datetime
-    ) -> tuple[str, bool]:
+    async def get_formatted_schedule(self, chat_id: int, date: datetime) -> tuple[str, bool]:
         date_str = date.strftime("%Y-%m-%d")
         date_display = format_date_ua(date)
 
@@ -183,9 +176,7 @@ class PowerService:
             user = result.scalar_one_or_none()
             user_group = user.group if user else settings.DEFAULT_GROUP
 
-        cached_times, updated_at = await self.get_schedule_from_cache(
-            date_str, user_group
-        )
+        cached_times, updated_at = await self.get_schedule_from_cache(date_str, user_group)
 
         if cached_times is None:
             try:
@@ -199,9 +190,7 @@ class PowerService:
             ) as exc:
                 logger.warning(f"Could not refresh schedule for {date_str}: {exc}")
 
-            cached_times, updated_at = await self.get_schedule_from_cache(
-                date_str, user_group
-            )
+            cached_times, updated_at = await self.get_schedule_from_cache(date_str, user_group)
             if cached_times is None:
                 cached_times, updated_at = await self.get_schedule_from_cache(
                     date_str, user_group, allow_stale=True
