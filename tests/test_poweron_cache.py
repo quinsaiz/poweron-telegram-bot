@@ -52,16 +52,17 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             )
             await session.commit()
 
-    def mock_api(self, *, times=None, error=False, date_graph=None, group=None):
+    def mock_api(self, *, times=None, error=False, date_graph=None, group=None, payload=None):
         real_client = httpx.AsyncClient
 
         def respond(request):
             self.requests.append(request)
             if error:
                 raise httpx.ConnectError("upstream unavailable", request=request)
-            return httpx.Response(
-                200,
-                json={
+            response_payload = (
+                payload
+                if payload is not None
+                else {
                     "hydra:member": [
                         {
                             "id": 1,
@@ -69,8 +70,9 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
                             "dataJson": {group or self.group: {"times": times}},
                         }
                     ]
-                },
+                }
             )
+            return httpx.Response(200, json=response_payload)
 
         transport = httpx.MockTransport(respond)
         client_patch = patch.object(
@@ -216,6 +218,41 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok)
         self.assertEqual(text, "❌ **Графіка на 15 січня ще немає**")
         self.assertEqual(len(self.requests), 1)
+
+    async def test_live_empty_payload_returns_no_schedule_without_error_logging(self):
+        await self.add_user()
+        self.mock_api(payload={"hydra:totalItems": 0, "hydra:member": None})
+
+        with (
+            patch.object(service_module.logger, "warning") as warning,
+            patch.object(service_module.logger, "error") as error,
+            patch.object(service_module.logger, "exception") as exception,
+        ):
+            text, ok = await self.service.get_formatted_schedule(self.chat_id, self.date)
+
+        self.assertFalse(ok)
+        self.assertEqual(text, "❌ **Графіка на 15 січня ще немає**")
+        self.assertEqual(len(self.requests), 1)
+        warning.assert_not_called()
+        error.assert_not_called()
+        exception.assert_not_called()
+        async with self.session() as session:
+            rows = (await session.execute(select(ScheduleCache))).scalars().all()
+        self.assertEqual(rows, [])
+
+    async def test_live_empty_payload_keeps_matching_stale_cache(self):
+        await self.add_user()
+        await self.add_cache()
+        self.mock_api(payload={"hydra:totalItems": 0, "hydra:member": None})
+
+        text, ok = await self.service.get_formatted_schedule(self.chat_id, self.date)
+
+        self.assertTrue(ok)
+        self.assertIn("🟢 Є світло", text)
+        self.assertEqual(len(self.requests), 1)
+        async with self.session() as session:
+            cache = (await session.execute(select(ScheduleCache))).scalar_one()
+        self.assertEqual(json.loads(cache.times_json), {"00:00": "0"})
 
     async def test_stale_cache_never_crosses_group_or_date(self):
         await self.add_user(group="4.1")
