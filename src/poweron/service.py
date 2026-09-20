@@ -1,8 +1,12 @@
 import httpx
 import base64
 import json
+import re
 from datetime import datetime, timedelta, timezone
+from pydantic import ValidationError
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.orm.exc import StaleDataError
 from zoneinfo import ZoneInfo
 
 from src.config import settings
@@ -13,6 +17,8 @@ from src.database.models import User, ScheduleCache
 from src.poweron.utils import format_schedule, format_date_ua, get_current_status
 
 logger = setup_logger(__name__, settings.LOG_LEVEL)
+TIME_PATTERN = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
+VALID_STATUSES = {"0", "1", "10"}
 
 
 class PowerService:
@@ -28,7 +34,9 @@ class PowerService:
         }
 
     @staticmethod
-    async def get_schedule_from_cache(date_str: str, group: str = "3.2"):
+    async def get_schedule_from_cache(
+        date_str: str, group: str = "3.2", allow_stale: bool = False
+    ):
         async with async_session() as session:
             result = await session.execute(
                 select(ScheduleCache).where(
@@ -44,54 +52,83 @@ class PowerService:
 
                 time_diff = (datetime.now(timezone.utc) - cache_time).total_seconds()
 
-                if time_diff < 1800:
-                    logger.info(f"Cache HIT for {date_str} (age: {int(time_diff)}s)")
-                    return json.loads(cache.times_json), cache_time
-                else:
+                if time_diff >= 1800 and not allow_stale:
                     logger.info(
                         f"Cache EXPIRED for {date_str} (age: {int(time_diff)}s)"
                     )
+                    return None, None
+
+                try:
+                    times = json.loads(cache.times_json)
+                except (TypeError, ValueError):
+                    logger.warning(f"Invalid cached schedule for {date_str}, group {group}")
+                    return None, None
+
+                if not isinstance(times, dict) or not times:
+                    return None, None
+
+                logger.info(f"Cache HIT for {date_str} (age: {int(time_diff)}s)")
+                return times, cache_time
 
             return None, None
 
     @staticmethod
     async def save_schedule_to_cache(date_str: str, group: str, times_dict: dict):
         async with async_session() as session:
-            result = await session.execute(
-                select(ScheduleCache).where(
-                    ScheduleCache.date_graph == date_str, ScheduleCache.group == group
+            try:
+                result = await session.execute(
+                    select(ScheduleCache).where(ScheduleCache.date_graph == date_str)
                 )
-            )
-            cache = result.scalar_one_or_none()
+                cache = result.scalar_one_or_none()
+                times_json = json.dumps(times_dict, ensure_ascii=False)
 
-            times_json = json.dumps(times_dict, ensure_ascii=False)
-
-            if cache:
-                cache.times_json = times_json
-                cache.updated_at = datetime.now(timezone.utc)
+                if cache:
+                    cache.group = group
+                    cache.times_json = times_json
+                    cache.updated_at = datetime.now(timezone.utc)
+                else:
+                    session.add(
+                        ScheduleCache(
+                            date_graph=date_str,
+                            group=group,
+                            times_json=times_json,
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    )
                 await session.commit()
-                logger.info(f"Cache UPDATED for {date_str}")
-            else:
-                new_cache = ScheduleCache(
-                    date_graph=date_str,
-                    group=group,
-                    times_json=times_json,
-                    updated_at=datetime.now(timezone.utc),
-                )
-                session.add(new_cache)
-                await session.commit()
-                logger.info(f"Cache SAVED for {date_str}")
+            except (DBAPIError, StaleDataError):
+                await session.rollback()
+                raise
 
-    async def get_schedule(self, group: str | None = None):
+            logger.info(f"Cache {'UPDATED' if cache else 'SAVED'} for {date_str}")
+
+    @staticmethod
+    def valid_times(times: dict[str, str]) -> bool:
+        return bool(times) and all(
+            isinstance(time, str)
+            and TIME_PATTERN.fullmatch(time) is not None
+            and isinstance(status, str)
+            and status in VALID_STATUSES
+            for time, status in times.items()
+        )
+
+    async def get_schedule(self, group: str | None = None, date: datetime | None = None):
         target_group = group or settings.DEFAULT_GROUP
 
         now = datetime.now(timezone.utc)
-        after_dt = (now - timedelta(days=1)).replace(
-            hour=12, minute=0, second=0, microsecond=0
-        )
-        before_dt = (now + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        if date is None:
+            after_dt = (now - timedelta(days=1)).replace(
+                hour=12, minute=0, second=0, microsecond=0
+            )
+            before_dt = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+        else:
+            requested_midnight = datetime.combine(
+                date.date(), datetime.min.time(), tzinfo=timezone.utc
+            )
+            after_dt = requested_midnight - timedelta(hours=12)
+            before_dt = requested_midnight + timedelta(days=1, hours=12)
 
         params = {
             "before": before_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
@@ -107,30 +144,30 @@ class PowerService:
             response = await client.get(self.base_url, params=params)
 
             if response.status_code == 200:
-                json_data = response.json()
-                events = json_data.get("hydra:member", [])
+                schedule = ScheduleResponse.model_validate(response.json())
+                if not schedule.events:
+                    return None
 
-                if events:
-                    for event in events:
-                        raw_date = event.get("dateGraph")
-                        if not raw_date:
-                            continue
+                requested_date = date.strftime("%Y-%m-%d") if date is not None else None
+                schedules_to_save = {}
+                for event in schedule.events:
+                    date_graph = event.date_graph.split("T")[0]
+                    if requested_date is not None and date_graph != requested_date:
+                        continue
+                    group_info = event.data_json.get(target_group)
+                    if group_info is None:
+                        continue
+                    if not self.valid_times(group_info.times):
+                        logger.warning(
+                            f"Invalid upstream schedule for {date_graph}, group {target_group}"
+                        )
+                        return None
+                    schedules_to_save.setdefault(date_graph, group_info.times)
 
-                        date_graph = raw_date.split("T")[0]
-                        data_json = event.get("dataJson", {})
+                for date_graph, times in schedules_to_save.items():
+                    await self.save_schedule_to_cache(date_graph, target_group, times)
 
-                        group_info = None
-                        if isinstance(data_json, dict):
-                            group_info = data_json.get(target_group)
-
-                        if date_graph and group_info and target_group:
-                            await self.save_schedule_to_cache(
-                                date_graph, target_group, group_info.get("times", {})
-                            )
-
-                    return ScheduleResponse(**json_data)
-
-                return None
+                return schedule
             else:
                 logger.error(f"Error {response.status_code}: {response.text[:200]}")
                 return None
@@ -150,12 +187,25 @@ class PowerService:
             date_str, user_group
         )
 
-        # if not cached_times:
-        #     logger.info(f"Cache miss for {date_str}, fetching from API...")
-        #     await self.get_schedule(group=user_group)
-        #     cached_times, updated_at = await self.get_schedule_from_cache(
-        #         date_str, user_group
-        #     )
+        if cached_times is None:
+            try:
+                await self.get_schedule(group=user_group, date=date)
+            except (
+                httpx.HTTPError,
+                json.JSONDecodeError,
+                ValidationError,
+                DBAPIError,
+                StaleDataError,
+            ) as exc:
+                logger.warning(f"Could not refresh schedule for {date_str}: {exc}")
+
+            cached_times, updated_at = await self.get_schedule_from_cache(
+                date_str, user_group
+            )
+            if cached_times is None:
+                cached_times, updated_at = await self.get_schedule_from_cache(
+                    date_str, user_group, allow_stale=True
+                )
 
         if cached_times is None or updated_at is None:
             return f"❌ **Графіка на {date_display} ще немає**", False
