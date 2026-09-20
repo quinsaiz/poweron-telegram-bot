@@ -22,33 +22,35 @@ dev = [
 [tool.ruff]
 target-version = "py314"
 line-length = 100
-exclude = [
-    "alembic",
-]
+src = ["src"]
 
 [tool.ruff.lint]
 select = [
-    "E", # pycodestyle errors
-    "W", # pycodestyle warnings
-    "F", # pyflakes
-    "I", # isort
-    "C90", # mccabe complexity
-    "SIM", # flake8-simplify
-    "TCH", # flake8-type-checking (TYPE_CHECKING blocks)
-    "ASYNC", # flake8-async
-    "UP", # pyupgrade
+    "E",
+    "W",
+    "F",
+    "I",
+    "C90",
+    "SIM",
+    "TCH",
+    "ASYNC",
+    "UP",
 ]
 ignore = [
-    "E501", # line too long
+    "E501",
 ]
 unfixable = [
-    "F401", # unused imports
+    "F401",
 ]
 
-# ---- Mypy ----
 [tool.mypy]
 python_version = "3.14"
 strict = true
 plugins = [
     "pydantic.mypy",
 ]
+files = [
+    "src",
+]
+warn_unused_configs = true
+show_error_codes = true
