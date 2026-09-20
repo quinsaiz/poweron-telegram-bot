@@ -1,0 +1,54 @@
+[project]
+name = "poweron-telegram-bot"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "aiogram==3.25.0",
+    "aiosqlite==0.22.1",
+    "fastapi==0.129.0",
+    "httpx==0.28.1",
+    "pydantic==2.12.5",
+    "pydantic-settings==2.12.0",
+    "sqlalchemy==2.0.46",
+    "uvicorn==0.40.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "ruff>=0.16.8",
+]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+exclude = [
+    "alembic",
+]
+
+[tool.ruff.lint]
+select = [
+    "E", # pycodestyle errors
+    "W", # pycodestyle warnings
+    "F", # pyflakes
+    "I", # isort
+    "C90", # mccabe complexity
+    "SIM", # flake8-simplify
+    "TCH", # flake8-type-checking (TYPE_CHECKING blocks)
+    "ASYNC", # flake8-async
+    "UP", # pyupgrade
+]
+ignore = [
+    "E501", # line too long
+]
+unfixable = [
+    "F401", # unused imports
+]
+
+# ---- Mypy ----
+[tool.mypy]
+python_version = "3.14"
+strict = true
+plugins = [
+    "pydantic.mypy",
+]

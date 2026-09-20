@@ -1,8 +1,14 @@
+__pycache__/
+*.py[cod]
+
+.venv/
+data/
+
+.ruff_cache/
+.mypy_cache/
+
 .vscode/
 .idea/
-.venv/
-__pycache__/
-data/
 
 .env
 *.db

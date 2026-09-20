@@ -1,16 +1,21 @@
 services:
   bot:
-    build: .
-    container_name: poweron-telegram-bot
+    build:
+      context: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9999:9999"
     env_file:
       - .env
     environment:
-      - TZ=Europe/Kyiv
+      TZ: Europe/Kyiv
+      PORT: "9999"
     volumes:
-      - /etc/localtime:/etc/localtime:ro
       - ./data:/app/data
+    init: true
+    stop_grace_period: 30s
     logging:
-      driver: "json-file"
+      driver: json-file
       options:
-        max-size: "10m"
+        max-size: 10m
         max-file: "3"

@@ -1,26 +1,32 @@
-FROM python:3.11-slim
+ARG UV_VERSION=0.12.17
+
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
+FROM python:3.14-slim-trixie
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY --from=uv /uv /uvx /bin/
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONPATH="/app" \
+    PYTHONUNBUFFERED="1" \
+    PYTHONDONTWRITEBYTECODE="1" \
+    PORT="9999"
+
+COPY pyproject.toml uv.lock ./
+
+RUN uv sync --locked --no-dev --no-install-project
 
 COPY src ./src
-
-COPY entrypoint.sh .
-
-RUN mkdir -p /app/data
+COPY entrypoint.sh ./
 
 RUN chmod +x /app/entrypoint.sh
 
-ENV PYTHONPATH=/app
-
-ENV PORT=8000
-
-EXPOSE 8000
+EXPOSE 9999
 
 ENTRYPOINT ["/app/entrypoint.sh"]
