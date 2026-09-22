@@ -63,7 +63,6 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "bot", SimpleNamespace(session=self.session)),
         )
         self.patches.enter_context(patch.object(main, "engine", self.engine))
-        self.patches.enter_context(patch.object(main, "init_db", new_callable=AsyncMock))
         self.patches.enter_context(patch.object(main, "check_updates_loop", monitor))
 
     async def test_shutdown_stops_polling_cancels_scheduler_and_closes_resources(self):

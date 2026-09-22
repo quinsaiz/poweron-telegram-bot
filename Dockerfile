@@ -23,9 +23,12 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
 
 COPY src ./src
+COPY alembic.ini ./
+COPY migrations ./migrations
 COPY entrypoint.sh ./
 
-RUN chmod +x /app/entrypoint.sh
+RUN mkdir -p /app/data \
+    && chmod +x /app/entrypoint.sh
 
 EXPOSE 9999
 

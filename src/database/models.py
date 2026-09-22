@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from sqlalchemy import BigInteger, DateTime, Integer, String, Text
+from sqlalchemy import BigInteger, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -25,9 +25,10 @@ class ScheduleState(Base):
 
 class ScheduleCache(Base):
     __tablename__ = "schedule_cache"
+    __table_args__ = (UniqueConstraint("date_graph", "group", name="uq_schedule_cache_date_group"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    date_graph: Mapped[str] = mapped_column(String, unique=True)
+    date_graph: Mapped[str] = mapped_column(String)
     group: Mapped[str] = mapped_column(String, default="3.2")
     times_json: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))

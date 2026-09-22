@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from pydantic import ValidationError
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm.exc import StaleDataError
 
@@ -75,31 +76,27 @@ class PowerService:
     async def save_schedule_to_cache(date_str: str, group: str, times_dict: dict[str, str]) -> None:
         async with async_session() as session:
             try:
-                result = await session.execute(
-                    select(ScheduleCache).where(ScheduleCache.date_graph == date_str)
-                )
-                cache = result.scalar_one_or_none()
                 times_json = json.dumps(times_dict, ensure_ascii=False)
-
-                if cache:
-                    cache.group = group
-                    cache.times_json = times_json
-                    cache.updated_at = datetime.now(UTC)
-                else:
-                    session.add(
-                        ScheduleCache(
-                            date_graph=date_str,
-                            group=group,
-                            times_json=times_json,
-                            updated_at=datetime.now(UTC),
-                        )
-                    )
+                statement = insert(ScheduleCache).values(
+                    date_graph=date_str,
+                    group=group,
+                    times_json=times_json,
+                    updated_at=datetime.now(UTC),
+                )
+                statement = statement.on_conflict_do_update(
+                    index_elements=[ScheduleCache.date_graph, ScheduleCache.group],
+                    set_={
+                        "times_json": statement.excluded.times_json,
+                        "updated_at": statement.excluded.updated_at,
+                    },
+                )
+                await session.execute(statement)
                 await session.commit()
             except DBAPIError, StaleDataError:
                 await session.rollback()
                 raise
 
-            logger.info(f"Cache {'UPDATED' if cache else 'SAVED'} for {date_str}")
+            logger.info("Cache saved for %s, group %s", date_str, group)
 
     @staticmethod
     def valid_times(times: dict[str, str]) -> bool:

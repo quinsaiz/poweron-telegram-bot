@@ -7,7 +7,7 @@ from aiogram.utils.chat_action import ChatActionMiddleware
 from fastapi import FastAPI
 
 from src.config import settings
-from src.database.engine import engine, init_db
+from src.database.engine import engine
 from src.logger import setup_logger
 from src.poweron.scheduler import check_updates_loop
 from src.telegram.bot import bot, dp
@@ -182,7 +182,6 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     monitor_task = None
     try:
         logger.info("Starting bot services...")
-        await init_db()
         polling_task = asyncio.create_task(
             dp.start_polling(
                 bot,

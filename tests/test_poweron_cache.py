@@ -449,7 +449,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             rows = (await session.execute(select(ScheduleCache))).scalars().all()
         self.assertEqual(rows, [])
 
-    async def test_successful_refresh_replaces_other_group_for_same_date(self):
+    async def test_successful_refresh_preserves_other_group_for_same_date(self):
         await self.add_user()
         await self.add_cache(group="4.1")
         self.mock_api(times={"00:00": "1"})
@@ -459,9 +459,11 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         self.assertIn("🔴 Немає світла", text)
         async with self.session() as session:
-            cache = (await session.execute(select(ScheduleCache))).scalar_one()
-        self.assertEqual(cache.group, self.group)
-        self.assertEqual(json.loads(cache.times_json), {"00:00": "1"})
+            caches = (await session.execute(select(ScheduleCache))).scalars().all()
+        self.assertEqual(
+            {cache.group: json.loads(cache.times_json) for cache in caches},
+            {"3.2": {"00:00": "1"}, "4.1": {"00:00": "0"}},
+        )
 
     async def test_refresh_selects_non_default_user_group(self):
         await self.add_user(group="4.1")
