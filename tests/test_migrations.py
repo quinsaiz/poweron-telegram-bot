@@ -21,6 +21,7 @@ with patch.dict(os.environ, {"BOT_TOKEN": "test-only-token"}):
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INITIAL_REVISION = "initial_schema"
+HEAD_REVISION = "f412bdd7c3e0"
 MIGRATIONS_ROOT = PROJECT_ROOT / "migrations"
 VERSIONS_ROOT = MIGRATIONS_ROOT / "versions"
 
@@ -76,7 +77,7 @@ class StandardAlembicTests(unittest.TestCase):
     def test_fresh_database_upgrades_from_base_to_head(self) -> None:
         self.upgrade()
 
-        self.assertEqual(self.revision(), INITIAL_REVISION)
+        self.assertEqual(self.revision(), HEAD_REVISION)
         self.assertEqual(
             set(inspect(self.engine).get_table_names()),
             set(Base.metadata.tables) | {"alembic_version"},
@@ -86,19 +87,19 @@ class StandardAlembicTests(unittest.TestCase):
         self.upgrade()
         self.upgrade()
 
-        self.assertEqual(self.revision(), INITIAL_REVISION)
+        self.assertEqual(self.revision(), HEAD_REVISION)
         self.assertEqual(
             set(inspect(self.engine).get_table_names()),
             set(Base.metadata.tables) | {"alembic_version"},
         )
 
-    def test_alembic_current_reports_initial_revision(self) -> None:
+    def test_alembic_current_reports_head_revision(self) -> None:
         self.upgrade()
 
         result = run_alembic(self.url, "current")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"{INITIAL_REVISION} (head)", result.stdout)
+        self.assertIn(f"{HEAD_REVISION} (head)", result.stdout)
 
     def test_migrated_schema_matches_model_metadata(self) -> None:
         self.upgrade()
@@ -144,6 +145,86 @@ class StandardAlembicTests(unittest.TestCase):
             inspector.get_unique_constraints("users"),
             [{"name": None, "column_names": ["chat_id"]}],
         )
+
+    def test_outbox_constraints_foreign_key_and_due_index(self) -> None:
+        self.upgrade()
+
+        inspector = inspect(self.engine)
+        delivery_columns = {
+            column["name"]: column for column in inspector.get_columns("notification_deliveries")
+        }
+        self.assertTrue(delivery_columns["next_attempt_at"]["nullable"])
+        self.assertEqual(
+            inspector.get_unique_constraints("notification_deliveries"),
+            [
+                {
+                    "name": "uq_notification_deliveries_event_chat",
+                    "column_names": ["event_id", "chat_id"],
+                }
+            ],
+        )
+        self.assertEqual(
+            inspector.get_indexes("notification_deliveries"),
+            [
+                {
+                    "name": "ix_notification_deliveries_due",
+                    "column_names": ["status", "next_attempt_at"],
+                    "unique": 0,
+                    "dialect_options": {},
+                }
+            ],
+        )
+        self.assertEqual(
+            inspector.get_foreign_keys("notification_deliveries")[0]["name"],
+            "fk_notification_deliveries_event_id",
+        )
+        self.assertEqual(
+            {
+                constraint["name"]
+                for constraint in inspector.get_check_constraints("notification_deliveries")
+            },
+            {
+                "ck_notification_deliveries_attempt_count",
+                "ck_notification_deliveries_status",
+            },
+        )
+
+    def test_upgrade_and_downgrade_preserve_users_and_cache(self) -> None:
+        initial = run_alembic(self.url, "upgrade", INITIAL_REVISION)
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        with self.engine.begin() as connection:
+            connection.execute(text("INSERT INTO users (chat_id, \"group\") VALUES (7, '4.1')"))
+            connection.execute(
+                text(
+                    "INSERT INTO schedule_cache "
+                    '(date_graph, "group", times_json, updated_at) '
+                    "VALUES ('2026-09-22', '4.1', '{\"00:00\": \"0\"}', "
+                    "'2026-09-22 00:00:00')"
+                )
+            )
+
+        upgrade = run_alembic(self.url, "upgrade", "head")
+        self.assertEqual(upgrade.returncode, 0, upgrade.stderr)
+        self.assertNotIn("schedule_state", inspect(self.engine).get_table_names())
+        with self.engine.connect() as connection:
+            self.assertEqual(connection.scalar(text("SELECT chat_id FROM users")), 7)
+            self.assertEqual(
+                connection.scalar(text("SELECT times_json FROM schedule_cache")),
+                '{"00:00": "0"}',
+            )
+
+        downgrade = run_alembic(self.url, "downgrade", INITIAL_REVISION)
+        self.assertEqual(downgrade.returncode, 0, downgrade.stderr)
+        self.assertEqual(self.revision(), INITIAL_REVISION)
+        tables = set(inspect(self.engine).get_table_names())
+        self.assertIn("schedule_state", tables)
+        self.assertNotIn("notification_deliveries", tables)
+        with self.engine.connect() as connection:
+            self.assertEqual(connection.scalar(text("SELECT chat_id FROM users")), 7)
+            self.assertEqual(
+                connection.scalar(text("SELECT times_json FROM schedule_cache")),
+                '{"00:00": "0"}',
+            )
 
     def test_autogenerate_revision_uses_template_only_in_temporary_environment(self) -> None:
         real_versions = file_tree(VERSIONS_ROOT)
@@ -195,7 +276,7 @@ class StandardAlembicTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         self.assertIsInstance(module.revision, str)
-        self.assertEqual(module.down_revision, INITIAL_REVISION)
+        self.assertEqual(module.down_revision, HEAD_REVISION)
         self.assertIsNone(module.branch_labels)
         self.assertIsNone(module.depends_on)
         module.upgrade()
@@ -223,7 +304,7 @@ class MigrationConfigurationTests(unittest.TestCase):
         with engine.connect() as connection:
             self.assertEqual(
                 connection.scalar(text("SELECT version_num FROM alembic_version")),
-                INITIAL_REVISION,
+                HEAD_REVISION,
             )
 
     def test_database_url_environment_override_is_honored(self) -> None:

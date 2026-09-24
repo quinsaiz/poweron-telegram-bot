@@ -1,6 +1,34 @@
+import re
+from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+
+# PowerOn emits an RFC-3339-style timestamp with whole seconds and a mandatory
+# numeric offset: YYYY-MM-DDTHH:MM:SS+HH:MM (or the equivalent negative offset).
+DATE_GRAPH_PATTERN = re.compile(
+    r"[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"
+    r"T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+    r"[+-](?:[01][0-9]|2[0-3]):[0-5][0-9]"
+)
+
+
+def parse_date_graph(value: str | None) -> datetime | None:
+    if value is None or DATE_GRAPH_PATTERN.fullmatch(value) is None:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return None
 
 
 class GroupData(BaseModel):
@@ -8,15 +36,33 @@ class GroupData(BaseModel):
 
 
 class ScheduleMember(BaseModel):
-    id: int
-    date_graph: str = Field(..., alias="dateGraph")
-    data_json: dict[str, GroupData] = Field(..., alias="dataJson")
+    # Members are intentionally tolerant here so one incomplete upstream member does
+    # not hide other usable members. Usability is decided per event and group.
+    id: StrictInt | StrictStr | None = None
+    date_graph: str | None = Field(default=None, alias="dateGraph", strict=True)
+    data_json: Any = Field(default_factory=dict, alias="dataJson")
 
 
 class ScheduleResponse(BaseModel):
     events: list[ScheduleMember] = Field(..., alias="hydra:member")
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("events", mode="before")
+    @classmethod
+    def isolate_malformed_members(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+
+        members: list[ScheduleMember] = []
+        for raw_member in value:
+            try:
+                members.append(ScheduleMember.model_validate(raw_member))
+            except ValidationError:
+                # Retain an unusable placeholder so one malformed member cannot make
+                # valid siblings disappear with a response-wide validation failure.
+                members.append(ScheduleMember())
+        return members
 
     @model_validator(mode="before")
     @classmethod

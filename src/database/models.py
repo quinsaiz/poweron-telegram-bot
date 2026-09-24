@@ -1,6 +1,16 @@
 from datetime import UTC, datetime
 
-from sqlalchemy import BigInteger, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -14,13 +24,6 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     chat_id: Mapped[int] = mapped_column(BigInteger, unique=True)
     group: Mapped[str] = mapped_column(String, default="3.2")
-
-
-class ScheduleState(Base):
-    __tablename__ = "schedule_state"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    last_id: Mapped[int] = mapped_column(Integer)
 
 
 class ScheduleCache(Base):
@@ -39,3 +42,44 @@ class BannedUser(Base):
 
     chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     until_date: Mapped[datetime] = mapped_column(DateTime)
+
+
+class ProcessedScheduleEvent(Base):
+    __tablename__ = "processed_schedule_events"
+
+    event_id: Mapped[str] = mapped_column(String, primary_key=True)
+    date_graph: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class NotificationDelivery(Base):
+    __tablename__ = "notification_deliveries"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'sent', 'exhausted', 'terminal')",
+            name="ck_notification_deliveries_status",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_notification_deliveries_attempt_count"),
+        UniqueConstraint("event_id", "chat_id", name="uq_notification_deliveries_event_chat"),
+        Index("ix_notification_deliveries_due", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "processed_schedule_events.event_id",
+            name="fk_notification_deliveries_event_id",
+            ondelete="RESTRICT",
+        )
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    recipient_group: Mapped[str] = mapped_column(String)
+    event_date: Mapped[str] = mapped_column(String)
+    message: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String)
+    attempt_count: Mapped[int] = mapped_column(Integer)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)

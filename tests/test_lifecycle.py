@@ -11,7 +11,7 @@ from aiogram import Bot
 
 with patch.dict(os.environ, {"BOT_TOKEN": "123:test-only-token"}):
     from src import main
-    from src.poweron.scheduler import send_notification
+    from src.poweron.scheduler import check_updates_loop
     from src.telegram.middlewares import AntiFloodMiddleware
 
 
@@ -180,8 +180,8 @@ class RuntimeAnnotationTests(unittest.TestCase):
         self.assertIn("return", main.lifespan.__annotations__)
 
     def test_scheduler_annotations_can_be_evaluated(self):
-        self.assertIs(get_type_hints(send_notification)["bot"], Bot)
-        self.assertIs(inspect.get_annotations(send_notification, eval_str=True)["bot"], Bot)
+        self.assertIs(get_type_hints(check_updates_loop)["bot"], Bot)
+        self.assertIs(inspect.get_annotations(check_updates_loop, eval_str=True)["bot"], Bot)
 
     def test_middleware_annotations_can_be_evaluated(self):
         self.assertIn("handler", get_type_hints(AntiFloodMiddleware.__call__))

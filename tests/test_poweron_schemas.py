@@ -1,7 +1,8 @@
 import unittest
+from datetime import timedelta
 
 from pydantic import ValidationError
-from src.poweron.schemas import ScheduleResponse
+from src.poweron.schemas import ScheduleResponse, parse_date_graph
 
 
 class ScheduleResponseTests(unittest.TestCase):
@@ -28,12 +29,67 @@ class ScheduleResponseTests(unittest.TestCase):
             with self.subTest(total=total), self.assertRaises(ValidationError):
                 ScheduleResponse.model_validate({"hydra:totalItems": total, "hydra:member": None})
 
-    def test_malformed_populated_member_is_invalid(self):
-        for total in (0, 1):
-            with self.subTest(total=total), self.assertRaises(ValidationError):
-                ScheduleResponse.model_validate(
+    def test_incomplete_member_is_preserved_for_per_event_usability_check(self):
+        response = ScheduleResponse.model_validate(
+            {"hydra:totalItems": 1, "hydra:member": [{"id": 1, "dataJson": {}}]}
+        )
+
+        self.assertEqual(len(response.events), 1)
+        self.assertIsNone(response.events[0].date_graph)
+
+    def test_malformed_member_does_not_hide_valid_sibling(self):
+        response = ScheduleResponse.model_validate(
+            {
+                "hydra:member": [
+                    "not-an-event",
                     {
-                        "hydra:totalItems": total,
-                        "hydra:member": [{"id": 1, "dataJson": {}}],
-                    }
-                )
+                        "id": 7,
+                        "dateGraph": "2026-09-22T00:00:00+03:00",
+                        "dataJson": {"3.2": {"times": {"00:00": "0"}}},
+                    },
+                ]
+            }
+        )
+
+        self.assertIsNone(response.events[0].id)
+        self.assertEqual(response.events[1].id, 7)
+
+
+class DateGraphTests(unittest.TestCase):
+    def test_canonical_timestamp_boundaries_are_valid(self):
+        valid_values = {
+            "2026-09-22T00:00:00+03:00": timedelta(hours=3),
+            "2024-02-29T23:59:59+02:00": timedelta(hours=2),
+            "2026-01-01T12:30:45-05:30": -timedelta(hours=5, minutes=30),
+        }
+
+        for value, expected_offset in valid_values.items():
+            with self.subTest(value=value):
+                parsed = parse_date_graph(value)
+                self.assertIsNotNone(parsed)
+                self.assertEqual(parsed.utcoffset(), expected_offset)
+
+    def test_noncanonical_or_impossible_timestamps_are_invalid(self):
+        invalid_values = (
+            "2026-W39-2",
+            "2026-09-22",
+            "20260922T000000+0300",
+            "2026-09-22 00:00:00+03:00",
+            "2026/09/22T00:00:00+03:00",
+            "２０２６-０９-２２T００:００:００+０３:００",
+            "2026-13-22T00:00:00+03:00",
+            "2026-02-30T00:00:00+03:00",
+            "2026-09-22T24:00:00+03:00",
+            "2026-09-22T23:60:00+03:00",
+            "2026-09-22T23:59:60+03:00",
+            "2026-09-22T00:00:00",
+            "2026-09-22T00:00:00Z",
+            "2026-09-22T00:00:00+3:00",
+            "2026-09-22T00:00:00+24:00",
+            "2026-09-22T00:00:00+03:60",
+            "2026-09-22T00:00:00+03:00trailing",
+        )
+
+        for value in invalid_values:
+            with self.subTest(value=value):
+                self.assertIsNone(parse_date_graph(value))

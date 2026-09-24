@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 import json
 import os
+import time
 import unittest
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -13,6 +17,124 @@ with patch.dict(os.environ, {"BOT_TOKEN": "test-only-token"}):
     from src.poweron import service as service_module
 
 from src.database.models import Base, ScheduleCache, User
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+class DiscoveryFetchWindowTests(unittest.IsolatedAsyncioTestCase):
+    async def fetch(self, clock: Callable[[], datetime]) -> tuple[dict[str, str], frozenset[date]]:
+        requests: list[httpx.Request] = []
+        real_client = httpx.AsyncClient
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"hydra:totalItems": 0, "hydra:member": None})
+
+        transport = httpx.MockTransport(respond)
+        service = service_module.PowerService(clock=clock)
+        with patch.object(
+            service_module.httpx,
+            "AsyncClient",
+            side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
+        ):
+            result = await service.fetch_schedule()
+
+        self.assertEqual(len(requests), 1)
+        return dict(requests[0].url.params), result.relevant_dates
+
+    async def test_kyiv_calendar_dates_define_discovery_bounds(self) -> None:
+        cases = (
+            (
+                "before summer midnight",
+                datetime(2026, 9, 22, 20, 59, tzinfo=UTC),
+                "2026-09-20T21:00:00+00:00",
+                "2026-09-23T21:00:00+00:00",
+                frozenset((date(2026, 9, 22), date(2026, 9, 23))),
+            ),
+            (
+                "after summer midnight while UTC is previous date",
+                datetime(2026, 9, 22, 21, 1, tzinfo=UTC),
+                "2026-09-21T21:00:00+00:00",
+                "2026-09-24T21:00:00+00:00",
+                frozenset((date(2026, 9, 23), date(2026, 9, 24))),
+            ),
+            (
+                "ordinary winter daytime",
+                datetime(2026, 2, 10, 10, 0, tzinfo=UTC),
+                "2026-02-08T22:00:00+00:00",
+                "2026-02-11T22:00:00+00:00",
+                frozenset((date(2026, 2, 10), date(2026, 2, 11))),
+            ),
+            (
+                "fall DST transition",
+                datetime(2026, 10, 24, 21, 30, tzinfo=UTC),
+                "2026-10-23T21:00:00+00:00",
+                "2026-10-26T22:00:00+00:00",
+                frozenset((date(2026, 10, 25), date(2026, 10, 26))),
+            ),
+        )
+
+        for name, now, expected_after, expected_before, expected_dates in cases:
+            with self.subTest(name=name):
+                params, relevant_dates = await self.fetch(lambda now=now: now)
+                self.assertEqual(params["after"], expected_after)
+                self.assertEqual(params["before"], expected_before)
+                self.assertEqual(relevant_dates, expected_dates)
+
+    async def test_discovery_clock_is_read_once_across_kyiv_midnight(self) -> None:
+        instants = iter(
+            (
+                datetime(2026, 9, 22, 20, 59, tzinfo=UTC),
+                datetime(2026, 9, 22, 21, 1, tzinfo=UTC),
+            )
+        )
+        calls = 0
+
+        def sequential_clock() -> datetime:
+            nonlocal calls
+            calls += 1
+            return next(instants)
+
+        params, relevant_dates = await self.fetch(sequential_clock)
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(params["after"], "2026-09-20T21:00:00+00:00")
+        self.assertEqual(params["before"], "2026-09-23T21:00:00+00:00")
+        self.assertEqual(relevant_dates, frozenset((date(2026, 9, 22), date(2026, 9, 23))))
+
+    @unittest.skipUnless(hasattr(time, "tzset"), "time.tzset() is unavailable")
+    async def test_discovery_window_does_not_use_host_timezone(self) -> None:
+        now = datetime(2026, 1, 14, 22, 5, tzinfo=UTC)
+        original_tz = os.environ.get("TZ")
+        original_host_offset = now.astimezone().utcoffset()
+        results: list[tuple[dict[str, str], frozenset[date]]] = []
+        host_offsets = []
+
+        try:
+            for host_zone in ("Pacific/Kiritimati", "America/Los_Angeles"):
+                os.environ["TZ"] = host_zone
+                time.tzset()
+                host_offsets.append(now.astimezone().utcoffset())
+                results.append(await self.fetch(lambda: now))
+        finally:
+            if original_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = original_tz
+            time.tzset()
+
+        self.assertEqual(host_offsets, [timedelta(hours=14), -timedelta(hours=8)])
+        self.assertEqual(now.astimezone().utcoffset(), original_host_offset)
+        self.assertEqual(results[0], results[1])
+        params, relevant_dates = results[0]
+        self.assertEqual(params["after"], "2026-01-13T22:00:00+00:00")
+        self.assertEqual(params["before"], "2026-01-16T22:00:00+00:00")
+        self.assertEqual(relevant_dates, frozenset((date(2026, 1, 15), date(2026, 1, 16))))
+
+    def test_discovery_window_rejects_naive_clock_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "aware datetime"):
+            service_module.PowerService.discovery_fetch_window(datetime(2026, 1, 15))
 
 
 class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
