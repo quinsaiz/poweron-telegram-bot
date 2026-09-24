@@ -1,4 +1,9 @@
-from datetime import datetime
+from typing import TYPE_CHECKING
+
+from src.domain_time import as_kyiv, kyiv_now
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 
 def format_schedule(times: dict[str, str]) -> str:
@@ -29,12 +34,12 @@ def format_schedule(times: dict[str, str]) -> str:
     return "\n".join(formatted_blocks)
 
 
-def get_current_status(times: dict[str, str]) -> str:
+def get_current_status(times: dict[str, str], *, now: datetime | None = None) -> str:
     if not times:
         return ""
 
-    now = datetime.now()
-    current_time = now.strftime("%H:%M")
+    now_kyiv = kyiv_now() if now is None else as_kyiv(now, source="Current-status clock")
+    current_time = now_kyiv.strftime("%H:%M")
 
     status_map = {"0": "🟢 Є світло", "1": "🔴 Немає світла", "10": "🟡 Перемикання"}
 

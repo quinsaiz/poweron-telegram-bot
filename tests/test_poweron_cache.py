@@ -9,6 +9,12 @@ from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from poweron_live_fixtures import (
+    LIVE_EVENT_DATE,
+    LIVE_GROUP,
+    live_collection,
+    live_half_hour_times,
+)
 from sqlalchemy import delete, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -375,6 +381,27 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         async with self.session() as session:
             cache = (await session.execute(select(ScheduleCache))).scalar_one()
         self.assertEqual(json.loads(cache.times_json), {"00:00": "0"})
+
+    async def test_live_z_event_refreshes_exact_date_and_group_cache(self):
+        await self.add_user(group=LIVE_GROUP)
+        self.mock_api(payload=live_collection())
+        requested = datetime.combine(LIVE_EVENT_DATE, datetime.min.time(), tzinfo=UTC)
+        fixed_now = datetime(2026, 4, 10, 9, 0, tzinfo=UTC)
+        self.service.clock = lambda: fixed_now
+
+        with patch.object(service_module, "utc_now", return_value=fixed_now):
+            text, ok = await self.service.get_formatted_schedule(self.chat_id, requested)
+
+        self.assertTrue(ok)
+        self.assertIn(f"Група: **{LIVE_GROUP}**", text)
+        self.assertIn("🟢 Є світло", text)
+        self.assertIn("🔴 Немає світла", text)
+        self.assertIn("🟡 Перемикання", text)
+        async with self.session() as session:
+            cache = (await session.execute(select(ScheduleCache))).scalar_one()
+        self.assertEqual(cache.date_graph, LIVE_EVENT_DATE.isoformat())
+        self.assertEqual(cache.group, LIVE_GROUP)
+        self.assertEqual(json.loads(cache.times_json), live_half_hour_times())
 
     async def test_stale_cache_never_crosses_group_or_date(self):
         await self.add_user(group="4.1")

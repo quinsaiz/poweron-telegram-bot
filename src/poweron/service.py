@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from datetime import date as calendar_date
 from typing import TYPE_CHECKING
-from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic import ValidationError
@@ -19,6 +18,7 @@ from sqlalchemy.orm.exc import StaleDataError
 from src.config import settings
 from src.database.engine import async_session
 from src.database.models import ScheduleCache, User
+from src.domain_time import KYIV_TZ, as_kyiv, kyiv_now, utc_now
 from src.logger import setup_logger
 from src.poweron.schemas import GroupData, ScheduleMember, ScheduleResponse, parse_date_graph
 from src.poweron.utils import format_date_ua, format_schedule, get_current_status
@@ -31,11 +31,6 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__, settings.LOG_LEVEL)
 TIME_PATTERN = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 VALID_STATUSES = {"0", "1", "10"}
-KYIV_TZ = ZoneInfo("Europe/Kyiv")
-
-
-def utc_now() -> datetime:
-    return datetime.now(UTC)
 
 
 @dataclass(frozen=True)
@@ -87,15 +82,13 @@ class PowerService:
 
     @staticmethod
     def discovery_fetch_window(now: datetime) -> DiscoveryFetchWindow:
-        if now.tzinfo is None or now.utcoffset() is None:
-            raise ValueError("Discovery clock must return an aware datetime")
-
-        now_kyiv = now.astimezone(KYIV_TZ)
+        now_kyiv = as_kyiv(now, source="Discovery clock")
         local_today = now_kyiv.date()
         relevant_dates = frozenset((local_today, local_today + timedelta(days=1)))
 
-        # The API uses strict after/before bounds. One surrounding Kyiv midnight
-        # keeps both complete relevant calendar days inside the request window.
+        # The live endpoint currently returned events equal to both after and before.
+        # Surrounding Kyiv midnights and exact relevant-date filtering keep correctness
+        # independent of undocumented boundary behavior.
         after_local = datetime.combine(local_today - timedelta(days=1), time.min, tzinfo=KYIV_TZ)
         before_local = datetime.combine(local_today + timedelta(days=2), time.min, tzinfo=KYIV_TZ)
         return DiscoveryFetchWindow(
@@ -121,7 +114,7 @@ class PowerService:
                 if cache_time.tzinfo is None:
                     cache_time = cache_time.replace(tzinfo=UTC)
 
-                time_diff = (datetime.now(UTC) - cache_time).total_seconds()
+                time_diff = (utc_now() - cache_time).total_seconds()
 
                 if time_diff >= 1800 and not allow_stale:
                     logger.info(f"Cache EXPIRED for {date_str} (age: {int(time_diff)}s)")
@@ -176,7 +169,7 @@ class PowerService:
                     date_str,
                     group,
                     times_dict,
-                    datetime.now(UTC),
+                    utc_now(),
                 )
                 await session.commit()
             except DBAPIError, StaleDataError:
@@ -246,14 +239,17 @@ class PowerService:
         group: str,
         event_date: calendar_date,
         updated_at: datetime,
+        *,
+        now: datetime | None = None,
     ) -> str:
+        now_kyiv = kyiv_now() if now is None else as_kyiv(now, source="Schedule rendering clock")
         target_datetime = datetime.combine(event_date, datetime.min.time())
         date_display = format_date_ua(target_datetime)
         readable_text = format_schedule(times)
         current_status_text = ""
 
-        if event_date == datetime.now().date():
-            status = get_current_status(times)
+        if event_date == now_kyiv.date():
+            status = get_current_status(times, now=now_kyiv)
             if status:
                 current_status_text = f"⚡️ **Зараз:** {status}\n"
 
@@ -277,8 +273,10 @@ class PowerService:
         group: str,
         event_date: calendar_date,
         discovered_at: datetime,
+        *,
+        now: datetime | None = None,
     ) -> str:
-        caption = cls.render_schedule_caption(times, group, event_date, discovered_at)
+        caption = cls.render_schedule_caption(times, group, event_date, discovered_at, now=now)
         return f"🔔 **ОПУБЛІКОВАНО ОНОВЛЕННЯ!**\n\n{caption}"
 
     async def fetch_schedule(self, date: datetime | None = None) -> ScheduleFetchResult:
@@ -386,4 +384,13 @@ class PowerService:
         if cached_times is None or updated_at is None:
             return f"❌ **Графіка на {date_display} ще немає**", False
 
-        return self.render_schedule_caption(cached_times, user_group, date.date(), updated_at), True
+        return (
+            self.render_schedule_caption(
+                cached_times,
+                user_group,
+                date.date(),
+                updated_at,
+                now=self.clock(),
+            ),
+            True,
+        )

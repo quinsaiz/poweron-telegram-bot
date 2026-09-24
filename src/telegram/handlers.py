@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from aiogram import F, Router, types
 from aiogram.filters import Command
@@ -7,6 +7,7 @@ from sqlalchemy import select
 from src.config import settings
 from src.database.engine import async_session
 from src.database.models import User
+from src.domain_time import kyiv_now
 from src.logger import setup_logger
 from src.poweron.service import PowerService
 from src.telegram.utils import get_main_keyboard
@@ -70,7 +71,7 @@ async def get_today_schedule(message: types.Message) -> None:
         return
 
     service = PowerService()
-    text, _ = await service.get_formatted_schedule(message.from_user.id, datetime.now())
+    text, _ = await service.get_formatted_schedule(message.from_user.id, kyiv_now())
     await message.answer(text, parse_mode="Markdown")
 
 
@@ -80,7 +81,7 @@ async def get_tomorrow_schedule(message: types.Message) -> None:
         return
 
     service = PowerService()
-    tomorrow = datetime.now() + timedelta(days=1)
+    tomorrow = kyiv_now() + timedelta(days=1)
     text, _ = await service.get_formatted_schedule(message.from_user.id, tomorrow)
     await message.answer(text, parse_mode="Markdown")
 

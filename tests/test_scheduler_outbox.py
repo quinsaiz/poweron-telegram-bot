@@ -15,6 +15,14 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
 )
 from aiogram.methods import SendMessage
+from poweron_live_fixtures import (
+    LIVE_DATE_GRAPH,
+    LIVE_EVENT_DATE,
+    LIVE_EVENT_ID,
+    LIVE_GROUP,
+    live_collection,
+    live_half_hour_times,
+)
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -192,6 +200,12 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.events(), [])
         self.assertEqual(await self.deliveries(), [])
 
+    async def test_naive_scheduler_clock_is_rejected(self) -> None:
+        self.scheduler.clock = lambda: datetime(2026, 4, 10, 12, 0)
+
+        with self.assertRaisesRegex(ValueError, "Scheduler clock must return an aware datetime"):
+            await self.scheduler.process_due_deliveries()
+
     async def test_sqlite_foreign_key_rejects_orphan_delivery(self) -> None:
         with self.assertRaises(IntegrityError):
             async with self.session() as session, session.begin():
@@ -228,6 +242,31 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await self.scheduler.discover_events(), 1)
         self.assertEqual((await self.deliveries())[0].event_date, "2026-09-22")
+
+    async def test_live_z_event_creates_outbox_delivery_cache_and_notification(self) -> None:
+        self.now = datetime(2026, 4, 10, 9, 0, tzinfo=UTC)
+        await self.add_users((10, LIVE_GROUP))
+        schedule = ScheduleResponse.model_validate(live_collection())
+        self.service.fetch_schedule.return_value = ScheduleFetchResult(
+            schedule,
+            frozenset((LIVE_EVENT_DATE,)),
+        )
+
+        self.assertEqual(await self.scheduler.discover_events(), 1)
+
+        event = (await self.events())[0]
+        self.assertEqual(event.event_id, str(LIVE_EVENT_ID))
+        self.assertEqual(event.date_graph, LIVE_DATE_GRAPH)
+        delivery = (await self.deliveries())[0]
+        self.assertEqual(delivery.recipient_group, LIVE_GROUP)
+        self.assertEqual(delivery.event_date, LIVE_EVENT_DATE.isoformat())
+        self.assertIn("🔔 **ОПУБЛІКОВАНО ОНОВЛЕННЯ!**", delivery.message)
+        self.assertIn(f"Група: **{LIVE_GROUP}**", delivery.message)
+        self.assertIn("⚡️ **Зараз:**", delivery.message)
+        cache = (await self.caches())[0]
+        self.assertEqual(cache.date_graph, LIVE_EVENT_DATE.isoformat())
+        self.assertEqual(cache.group, LIVE_GROUP)
+        self.assertEqual(json.loads(cache.times_json), live_half_hour_times())
 
     async def test_missing_subscribed_group_creates_no_event_or_delivery(self) -> None:
         await self.add_users((10, "4.1"))

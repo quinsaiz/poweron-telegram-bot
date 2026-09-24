@@ -1,13 +1,21 @@
 import unittest
 from datetime import timedelta
 
+from poweron_live_fixtures import (
+    LIVE_DATE_GRAPH,
+    LIVE_EVENT_ID,
+    LIVE_GROUP,
+    live_collection,
+    live_empty_collection,
+    live_half_hour_times,
+)
 from pydantic import ValidationError
 from src.poweron.schemas import ScheduleResponse, parse_date_graph
 
 
 class ScheduleResponseTests(unittest.TestCase):
     def test_null_members_with_zero_total_is_empty(self):
-        response = ScheduleResponse.model_validate({"hydra:totalItems": 0, "hydra:member": None})
+        response = ScheduleResponse.model_validate(live_empty_collection())
 
         self.assertEqual(response.events, [])
 
@@ -54,13 +62,24 @@ class ScheduleResponseTests(unittest.TestCase):
         self.assertIsNone(response.events[0].id)
         self.assertEqual(response.events[1].id, 7)
 
+    def test_live_z_member_passes_pydantic_validation(self):
+        response = ScheduleResponse.model_validate(live_collection())
+
+        self.assertEqual(len(response.events), 1)
+        event = response.events[0]
+        self.assertEqual(event.id, LIVE_EVENT_ID)
+        self.assertEqual(event.date_graph, LIVE_DATE_GRAPH)
+        self.assertEqual(event.data_json[LIVE_GROUP]["times"], live_half_hour_times())
+
 
 class DateGraphTests(unittest.TestCase):
     def test_canonical_timestamp_boundaries_are_valid(self):
         valid_values = {
+            "2026-04-10T00:00:00Z": timedelta(0),
             "2026-09-22T00:00:00+03:00": timedelta(hours=3),
             "2024-02-29T23:59:59+02:00": timedelta(hours=2),
             "2026-01-01T12:30:45-05:30": -timedelta(hours=5, minutes=30),
+            "2026-01-01T12:30:45+23:59": timedelta(hours=23, minutes=59),
         }
 
         for value, expected_offset in valid_values.items():
@@ -75,6 +94,7 @@ class DateGraphTests(unittest.TestCase):
             "2026-09-22",
             "20260922T000000+0300",
             "2026-09-22 00:00:00+03:00",
+            "2026-09-22t00:00:00+03:00",
             "2026/09/22T00:00:00+03:00",
             "２０２６-０９-２２T００:００:００+０３:００",
             "2026-13-22T00:00:00+03:00",
@@ -83,10 +103,12 @@ class DateGraphTests(unittest.TestCase):
             "2026-09-22T23:60:00+03:00",
             "2026-09-22T23:59:60+03:00",
             "2026-09-22T00:00:00",
-            "2026-09-22T00:00:00Z",
+            "2026-09-22T00:00:00z",
+            "2026-09-22T00:00:00.000Z",
             "2026-09-22T00:00:00+3:00",
             "2026-09-22T00:00:00+24:00",
             "2026-09-22T00:00:00+03:60",
+            "2026-09-22T00:00:00Ztrailing",
             "2026-09-22T00:00:00+03:00trailing",
         )
 

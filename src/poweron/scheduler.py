@@ -33,6 +33,7 @@ from sqlalchemy.orm.exc import StaleDataError
 from src.config import settings
 from src.database.engine import async_session
 from src.database.models import NotificationDelivery, ProcessedScheduleEvent, User
+from src.domain_time import utc_now
 from src.logger import setup_logger
 from src.poweron.service import PowerService, ScheduleFetchResult
 
@@ -82,10 +83,6 @@ class PreparedEvent:
     messages: dict[str, str]
 
 
-def utc_now() -> datetime:
-    return datetime.now(UTC)
-
-
 def _as_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
@@ -126,6 +123,12 @@ class ScheduleScheduler:
         self._discovery_lock = asyncio.Lock()
         self._delivery_lock = asyncio.Lock()
 
+    def _clock_now(self) -> datetime:
+        value = self.clock()
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Scheduler clock must return an aware datetime")
+        return value.astimezone(UTC)
+
     async def _load_users(self) -> list[User]:
         async with self.session_factory() as session:
             return list((await session.execute(select(User))).scalars().all())
@@ -159,7 +162,11 @@ class ScheduleScheduler:
         for group, times in usable.group_times.items():
             try:
                 messages[group] = self.service.render_notification(
-                    times, group, usable.event_date, discovered_at
+                    times,
+                    group,
+                    usable.event_date,
+                    discovered_at,
+                    now=discovered_at,
                 )
             except (KeyError, TypeError, ValueError) as error:
                 logger.warning(
@@ -323,7 +330,7 @@ class ScheduleScheduler:
 
         users = await self._load_users()
         subscribed_groups = {user.group for user in users}
-        discovered_at = _as_utc(self.clock())
+        discovered_at = self._clock_now()
         accepted = self._reconcile_events(fetch, subscribed_groups, discovered_at)
         persisted = 0
         cacheable: list[PreparedEvent] = []
@@ -456,7 +463,7 @@ class ScheduleScheduler:
             await session.execute(delete(User).where(User.chat_id == attempt.chat_id))
 
     async def _deliver_one(self, delivery_id: int) -> bool:
-        attempt = await self._load_due_delivery(delivery_id, self.clock())
+        attempt = await self._load_due_delivery(delivery_id, self._clock_now())
         if attempt is None:
             return False
 
@@ -466,19 +473,19 @@ class ScheduleScheduler:
             raise
         except TelegramRetryAfter as error:
             await self._record_transient_failure(
-                attempt, error, self.clock(), retry_after=float(error.retry_after)
+                attempt, error, self._clock_now(), retry_after=float(error.retry_after)
             )
         except (TelegramForbiddenError, TelegramNotFound) as error:
-            await self._record_terminal_failure(attempt, error, self.clock())
+            await self._record_terminal_failure(attempt, error, self._clock_now())
         except (TelegramAPIError, ClientDecodeError) as error:
-            await self._record_transient_failure(attempt, error, self.clock())
+            await self._record_transient_failure(attempt, error, self._clock_now())
         except Exception:
             logger.exception(
                 "Unexpected local error while sending delivery id=%s; delivery remains pending",
                 attempt.id,
             )
         else:
-            await self._record_success(attempt, self.clock())
+            await self._record_success(attempt, self._clock_now())
             return True
         return False
 
@@ -486,7 +493,7 @@ class ScheduleScheduler:
         """Attempt each currently due row once without a DB transaction during Telegram I/O."""
 
         async with self._delivery_lock:
-            delivery_ids = await self._due_delivery_ids(self.clock())
+            delivery_ids = await self._due_delivery_ids(self._clock_now())
             sent = 0
             for delivery_id in delivery_ids:
                 try:
