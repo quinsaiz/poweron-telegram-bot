@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import get_type_hints
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from aiogram import Bot
 from sqlalchemy.exc import ArgumentError, InvalidRequestError, OperationalError
 
@@ -92,10 +93,11 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_shutdown_stops_polling_cancels_scheduler_and_closes_resources(self):
-        async with main.lifespan(main.app):
-            await self.dispatcher.started.wait()
-            await self.monitor_started.wait()
-            self.assertFalse(self.monitor_task.done())
+        with self.assertNoLogs(main.logger, level="ERROR"):
+            async with main.lifespan(main.app):
+                await self.dispatcher.started.wait()
+                await self.monitor_started.wait()
+                self.assertFalse(self.monitor_task.done())
 
         self.assertFalse(self.dispatcher.options["handle_signals"])
         self.assertFalse(self.dispatcher.options["close_bot_session"])
@@ -305,6 +307,171 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(isinstance(error, ValueError) for error in caught.exception.exceptions))
         self.session.close.assert_awaited_once_with()
         self.engine.dispose.assert_awaited_once_with()
+
+
+class RuntimeHealthTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.previous_health = main.app.state.runtime_health
+        main.app.state.runtime_health = main.RuntimeHealth()
+        self.addAsyncCleanup(self._restore_health)
+
+    async def _restore_health(self):
+        health = main.app.state.runtime_health
+        health.shutdown_started = True
+        for task in (health.polling_task, health.scheduler_task):
+            if task is not None and not task.done():
+                task.cancel()
+        pending = [
+            task
+            for task in (health.polling_task, health.scheduler_task)
+            if task is not None and not task.done()
+        ]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        main.app.state.runtime_health = self.previous_health
+
+    async def _get(self, path: str) -> httpx.Response:
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.get(path)
+
+    @staticmethod
+    async def _wait_forever(started: asyncio.Event) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    @staticmethod
+    async def _finish_on_release(started: asyncio.Event, release: asyncio.Event) -> None:
+        started.set()
+        await release.wait()
+
+    async def _running_health(self) -> main.RuntimeHealth:
+        health = main.RuntimeHealth(startup_completed=True)
+        polling_started = asyncio.Event()
+        scheduler_started = asyncio.Event()
+        health.set_worker("polling", asyncio.create_task(self._wait_forever(polling_started)))
+        health.set_worker("scheduler", asyncio.create_task(self._wait_forever(scheduler_started)))
+        main.app.state.runtime_health = health
+        await polling_started.wait()
+        await scheduler_started.wait()
+        return health
+
+    async def _health_with_completing_worker(
+        self, worker: str
+    ) -> tuple[main.RuntimeHealth, asyncio.Event]:
+        health = main.RuntimeHealth(startup_completed=True)
+        polling_started = asyncio.Event()
+        scheduler_started = asyncio.Event()
+        release = asyncio.Event()
+        polling_coro = (
+            self._finish_on_release(polling_started, release)
+            if worker == "polling"
+            else self._wait_forever(polling_started)
+        )
+        scheduler_coro = (
+            self._finish_on_release(scheduler_started, release)
+            if worker == "scheduler"
+            else self._wait_forever(scheduler_started)
+        )
+        health.set_worker("polling", asyncio.create_task(polling_coro))
+        health.set_worker("scheduler", asyncio.create_task(scheduler_coro))
+        main.app.state.runtime_health = health
+        await polling_started.wait()
+        await scheduler_started.wait()
+        return health, release
+
+    async def test_liveness_is_independent_of_worker_readiness(self):
+        response = await self._get("/health/live")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "alive"})
+
+    async def test_readiness_is_unavailable_before_startup_completes(self):
+        response = await self._get("/health/ready")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["components"]["application"], "starting")
+
+    async def test_running_workers_are_ready_and_root_is_truthful(self):
+        await self._running_health()
+
+        ready = await self._get("/health/ready")
+        root = await self._get("/")
+
+        self.assertEqual(ready.status_code, 200)
+        self.assertEqual(ready.json()["status"], "ready")
+        self.assertEqual(root.status_code, 200)
+        self.assertEqual(
+            root.json(),
+            {"status": "ok", "bot": "running", "scheduler": "running"},
+        )
+
+    async def test_completed_polling_task_makes_readiness_unavailable(self):
+        health, release = await self._health_with_completing_worker("polling")
+        release.set()
+        with self.assertLogs(main.logger, level="ERROR") as logs:
+            await health.polling_task
+            response = await self._get("/health/ready")
+            root = await self._get("/")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(root.status_code, 503)
+        self.assertEqual(root.json()["bot"], "stopped")
+        self.assertEqual(response.json()["components"]["telegram_polling"], "stopped")
+        self.assertIn("Telegram polling stopped unexpectedly", "\n".join(logs.output))
+
+    async def test_completed_scheduler_task_makes_readiness_unavailable(self):
+        health, release = await self._health_with_completing_worker("scheduler")
+        release.set()
+        with self.assertLogs(main.logger, level="ERROR"):
+            await health.scheduler_task
+            response = await self._get("/health/ready")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["components"]["scheduler"], "stopped")
+
+    async def test_failed_worker_is_logged_once_and_detail_is_not_exposed(self):
+        secret = "private-worker-detail"
+
+        async def fail(started: asyncio.Event, release: asyncio.Event) -> None:
+            started.set()
+            await release.wait()
+            raise ValueError(secret)
+
+        health = main.RuntimeHealth(startup_completed=True)
+        polling_started = asyncio.Event()
+        scheduler_started = asyncio.Event()
+        release = asyncio.Event()
+        health.set_worker("polling", asyncio.create_task(self._wait_forever(polling_started)))
+        failed_task = asyncio.create_task(fail(scheduler_started, release))
+        health.set_worker("scheduler", failed_task)
+        main.app.state.runtime_health = health
+        await polling_started.wait()
+        await scheduler_started.wait()
+
+        release.set()
+        with self.assertLogs(main.logger, level="ERROR") as logs:
+            await asyncio.gather(failed_task, return_exceptions=True)
+            response = await self._get("/health/ready")
+            await self._get("/health/ready")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["components"]["scheduler"], "failed")
+        self.assertNotIn(secret, response.text)
+        self.assertEqual(
+            sum("Scheduler failed unexpectedly" in record for record in logs.output),
+            1,
+        )
+
+    async def test_shutdown_in_progress_is_unavailable(self):
+        health = await self._running_health()
+        health.shutdown_started = True
+
+        response = await self._get("/health/ready")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["components"]["application"], "shutting_down")
+        self.assertEqual(response.json()["components"]["scheduler"], "shutting_down")
 
 
 class RuntimeAnnotationTests(unittest.TestCase):
