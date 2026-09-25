@@ -1,5 +1,3 @@
-"""Shared classification for retryable database infrastructure failures."""
-
 from sqlalchemy.exc import (
     DisconnectionError,
     InterfaceError,

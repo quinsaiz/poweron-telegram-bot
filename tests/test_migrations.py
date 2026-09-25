@@ -10,7 +10,19 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sqlalchemy import UniqueConstraint, create_engine, inspect, select, text
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+from sqlalchemy import (
+    CheckConstraint,
+    ForeignKeyConstraint,
+    Index,
+    UniqueConstraint,
+    create_engine,
+    inspect,
+    select,
+    text,
+)
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 from src.database.config import DatabaseSettings
@@ -27,9 +39,7 @@ with patch.dict(
     from src.poweron import service as service_module
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-INITIAL_REVISION = "initial_schema"
-PREVIOUS_HEAD_REVISION = "f412bdd7c3e0"
-HEAD_REVISION = "poweron_source_state"
+HEAD_REVISION = "20260925_initial_schema"
 MIGRATIONS_ROOT = PROJECT_ROOT / "migrations"
 VERSIONS_ROOT = MIGRATIONS_ROOT / "versions"
 
@@ -37,6 +47,7 @@ VERSIONS_ROOT = MIGRATIONS_ROOT / "versions"
 def isolated_environment(database_url: str) -> dict[str, str]:
     environment = os.environ.copy()
     environment.pop("BOT_TOKEN", None)
+    environment.pop("POWERON_CITY_ID", None)
     environment["DATABASE_URL"] = database_url
     environment["PYTHONPATH"] = str(PROJECT_ROOT)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -63,6 +74,15 @@ def file_tree(root: Path) -> dict[Path, bytes]:
     return {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
 
 
+def repository_python_artifacts() -> set[Path]:
+    return {
+        path
+        for root in (PROJECT_ROOT / "src", MIGRATIONS_ROOT, PROJECT_ROOT / "tests")
+        for path in root.rglob("*")
+        if path.name == "__pycache__" or path.suffix == ".pyc"
+    }
+
+
 class StandardAlembicTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -82,6 +102,13 @@ class StandardAlembicTests(unittest.TestCase):
         self.assertIsInstance(revision, str)
         return revision
 
+    def test_exactly_one_head_and_one_revision(self) -> None:
+        script = ScriptDirectory.from_config(Config(str(PROJECT_ROOT / "alembic.ini")))
+        self.assertEqual(script.get_heads(), [HEAD_REVISION])
+        revisions = list(script.walk_revisions())
+        self.assertEqual(len(revisions), 1)
+        self.assertIsNone(revisions[0].down_revision)
+
     def test_fresh_database_upgrades_from_base_to_head(self) -> None:
         self.upgrade()
 
@@ -95,6 +122,18 @@ class StandardAlembicTests(unittest.TestCase):
         self.upgrade()
         self.upgrade()
 
+        self.assertEqual(self.revision(), HEAD_REVISION)
+        self.assertEqual(
+            set(inspect(self.engine).get_table_names()),
+            set(Base.metadata.tables) | {"alembic_version"},
+        )
+
+    def test_base_head_base_head_cycle(self) -> None:
+        self.upgrade()
+        downgrade = run_alembic(self.url, "downgrade", "base")
+        self.assertEqual(downgrade.returncode, 0, downgrade.stderr)
+        self.assertEqual(set(inspect(self.engine).get_table_names()), {"alembic_version"})
+        self.upgrade()
         self.assertEqual(self.revision(), HEAD_REVISION)
         self.assertEqual(
             set(inspect(self.engine).get_table_names()),
@@ -139,6 +178,51 @@ class StandardAlembicTests(unittest.TestCase):
                         if isinstance(constraint, UniqueConstraint)
                     },
                 )
+                self.assertEqual(
+                    {
+                        (constraint["name"], constraint["sqltext"])
+                        for constraint in inspector.get_check_constraints(table_name)
+                    },
+                    {
+                        (constraint.name, str(constraint.sqltext))
+                        for constraint in model_table.constraints
+                        if isinstance(constraint, CheckConstraint)
+                    },
+                )
+                self.assertEqual(
+                    {
+                        (
+                            constraint["name"],
+                            tuple(constraint["constrained_columns"]),
+                            constraint["referred_table"],
+                            tuple(constraint["referred_columns"]),
+                            constraint["options"].get("ondelete"),
+                        )
+                        for constraint in inspector.get_foreign_keys(table_name)
+                    },
+                    {
+                        (
+                            constraint.name,
+                            tuple(column.name for column in constraint.columns),
+                            constraint.referred_table.name,
+                            tuple(element.column.name for element in constraint.elements),
+                            constraint.ondelete,
+                        )
+                        for constraint in model_table.constraints
+                        if isinstance(constraint, ForeignKeyConstraint)
+                    },
+                )
+                self.assertEqual(
+                    {
+                        (index["name"], tuple(index["column_names"]), bool(index["unique"]))
+                        for index in inspector.get_indexes(table_name)
+                    },
+                    {
+                        (index.name, tuple(column.name for column in index.columns), index.unique)
+                        for index in model_table.indexes
+                        if isinstance(index, Index)
+                    },
+                )
 
     def test_schedule_cache_has_only_composite_unique_constraint(self) -> None:
         self.upgrade()
@@ -158,29 +242,31 @@ class StandardAlembicTests(unittest.TestCase):
             {"id", "chat_id"},
         )
 
-    def test_previous_head_upgrade_removes_user_group_and_preserves_chat_id(self) -> None:
-        previous = run_alembic(self.url, "upgrade", PREVIOUS_HEAD_REVISION)
-        self.assertEqual(previous.returncode, 0, previous.stderr)
-        with self.engine.begin() as connection:
-            connection.execute(text("INSERT INTO users (chat_id, \"group\") VALUES (7, '4.1')"))
-
-        upgrade = run_alembic(self.url, "upgrade", "head")
-
-        self.assertEqual(upgrade.returncode, 0, upgrade.stderr)
-        self.assertEqual(self.revision(), HEAD_REVISION)
-        self.assertEqual(
-            {column["name"] for column in inspect(self.engine).get_columns("users")},
-            {"id", "chat_id"},
+    def test_composite_cache_uniqueness_is_enforced(self) -> None:
+        self.upgrade()
+        statement = text(
+            'INSERT INTO schedule_cache (date_graph, "group", times_json, updated_at) '
+            "VALUES (:date, :group, '{}', '2026-09-25 00:00:00')"
         )
-        with self.engine.connect() as connection:
-            self.assertEqual(connection.scalar(text("SELECT chat_id FROM users")), 7)
+        with self.engine.begin() as connection:
+            connection.execute(statement, {"date": "2026-09-25", "group": "3.2"})
+            connection.execute(statement, {"date": "2026-09-25", "group": "4.1"})
+            connection.execute(statement, {"date": "2026-09-26", "group": "3.2"})
+        with self.assertRaises(IntegrityError), self.engine.begin() as connection:
+            connection.execute(statement, {"date": "2026-09-25", "group": "3.2"})
 
-        downgrade = run_alembic(self.url, "downgrade", PREVIOUS_HEAD_REVISION)
-        self.assertEqual(downgrade.returncode, 0, downgrade.stderr)
-        columns = {column["name"] for column in inspect(self.engine).get_columns("users")}
-        self.assertEqual(columns, {"id", "chat_id", "group"})
-        with self.engine.connect() as connection:
-            self.assertEqual(connection.scalar(text('SELECT "group" FROM users')), "3.2")
+    def test_source_state_singleton_and_city_constraints_are_enforced(self) -> None:
+        self.upgrade()
+        with self.assertRaises(IntegrityError), self.engine.begin() as connection:
+            connection.execute(text("INSERT INTO poweron_source_state (id, city_id) VALUES (1, 0)"))
+        with self.engine.begin() as connection:
+            connection.execute(
+                text("INSERT INTO poweron_source_state (id, city_id) VALUES (1, 21005)")
+            )
+        with self.assertRaises(IntegrityError), self.engine.begin() as connection:
+            connection.execute(
+                text("INSERT INTO poweron_source_state (id, city_id) VALUES (2, 21005)")
+            )
 
     def test_outbox_constraints_foreign_key_and_due_index(self) -> None:
         self.upgrade()
@@ -215,6 +301,10 @@ class StandardAlembicTests(unittest.TestCase):
             "fk_notification_deliveries_event_id",
         )
         self.assertEqual(
+            inspector.get_foreign_keys("notification_deliveries")[0]["options"],
+            {"ondelete": "RESTRICT"},
+        )
+        self.assertEqual(
             {
                 constraint["name"]
                 for constraint in inspector.get_check_constraints("notification_deliveries")
@@ -225,45 +315,56 @@ class StandardAlembicTests(unittest.TestCase):
             },
         )
 
-    def test_upgrade_and_downgrade_preserve_users_and_cache(self) -> None:
-        initial = run_alembic(self.url, "upgrade", INITIAL_REVISION)
-        self.assertEqual(initial.returncode, 0, initial.stderr)
+    def test_sqlite_foreign_key_enforcement(self) -> None:
+        self.upgrade()
+        with self.engine.connect() as connection:
+            connection.execute(text("PRAGMA foreign_keys=ON"))
+            self.assertEqual(connection.scalar(text("PRAGMA foreign_keys")), 1)
+            with self.assertRaises(IntegrityError):
+                connection.execute(
+                    text(
+                        "INSERT INTO notification_deliveries "
+                        "(event_id, chat_id, recipient_group, event_date, message, status, "
+                        "attempt_count, created_at, updated_at) "
+                        "VALUES ('missing', 1, '3.2', '2026-09-25', 'test', 'pending', 0, "
+                        "'2026-09-25 00:00:00', '2026-09-25 00:00:00')"
+                    )
+                )
+
+    def test_notification_delivery_uniqueness_is_enforced(self) -> None:
+        self.upgrade()
         with self.engine.begin() as connection:
-            connection.execute(text("INSERT INTO users (chat_id, \"group\") VALUES (7, '4.1')"))
             connection.execute(
                 text(
-                    "INSERT INTO schedule_cache "
-                    '(date_graph, "group", times_json, updated_at) '
-                    "VALUES ('2026-09-22', '4.1', '{\"00:00\": \"0\"}', "
-                    "'2026-09-22 00:00:00')"
+                    "INSERT INTO processed_schedule_events (event_id, date_graph, created_at) "
+                    "VALUES ('event', '2026-09-25', '2026-09-25 00:00:00')"
                 )
             )
+        statement = text(
+            "INSERT INTO notification_deliveries "
+            "(event_id, chat_id, recipient_group, event_date, message, status, "
+            "attempt_count, created_at, updated_at) "
+            "VALUES ('event', :chat_id, '3.2', '2026-09-25', 'test', 'pending', 0, "
+            "'2026-09-25 00:00:00', '2026-09-25 00:00:00')"
+        )
+        with self.engine.begin() as connection:
+            connection.execute(statement, {"chat_id": 1})
+            connection.execute(statement, {"chat_id": 2})
+        with self.assertRaises(IntegrityError), self.engine.begin() as connection:
+            connection.execute(statement, {"chat_id": 1})
 
-        upgrade = run_alembic(self.url, "upgrade", "head")
-        self.assertEqual(upgrade.returncode, 0, upgrade.stderr)
-        self.assertNotIn("schedule_state", inspect(self.engine).get_table_names())
-        with self.engine.connect() as connection:
-            self.assertEqual(connection.scalar(text("SELECT chat_id FROM users")), 7)
-            self.assertEqual(
-                connection.scalar(text("SELECT times_json FROM schedule_cache")),
-                '{"00:00": "0"}',
-            )
-
-        downgrade = run_alembic(self.url, "downgrade", INITIAL_REVISION)
-        self.assertEqual(downgrade.returncode, 0, downgrade.stderr)
-        self.assertEqual(self.revision(), INITIAL_REVISION)
-        tables = set(inspect(self.engine).get_table_names())
-        self.assertIn("schedule_state", tables)
-        self.assertNotIn("notification_deliveries", tables)
-        with self.engine.connect() as connection:
-            self.assertEqual(connection.scalar(text("SELECT chat_id FROM users")), 7)
-            self.assertEqual(
-                connection.scalar(text("SELECT times_json FROM schedule_cache")),
-                '{"00:00": "0"}',
-            )
+    def test_no_legacy_schedule_state_or_user_group(self) -> None:
+        self.upgrade()
+        inspector = inspect(self.engine)
+        self.assertNotIn("schedule_state", inspector.get_table_names())
+        self.assertEqual(
+            {column["name"] for column in inspector.get_columns("users")},
+            {"id", "chat_id"},
+        )
 
     def test_autogenerate_revision_uses_template_only_in_temporary_environment(self) -> None:
         real_migrations = file_tree(MIGRATIONS_ROOT)
+        repository_artifacts = repository_python_artifacts()
         copied_root = Path(self.temp_dir.name) / "copied-environment"
         copied_migrations = copied_root / "migrations"
         copied_versions = copied_migrations / "versions"
@@ -320,10 +421,54 @@ class StandardAlembicTests(unittest.TestCase):
         self.assertIsNone(module.depends_on)
         module.upgrade()
         module.downgrade()
+        for command in (("check",), ("format", "--check")):
+            lint = subprocess.run(
+                [str(Path(sys.executable).with_name("ruff")), *command, str(generated_path)],
+                cwd=PROJECT_ROOT,
+                env=isolated_environment(self.url),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(lint.returncode, 0, lint.stdout + lint.stderr)
         self.assertEqual(
             preexisting_cache.read_bytes(),
             b"pre-existing cache sentinel",
         )
+        self.assertEqual(file_tree(MIGRATIONS_ROOT), real_migrations)
+        self.assertEqual(repository_python_artifacts(), repository_artifacts)
+
+    def test_autogenerate_base_revision_is_ruff_clean_in_temporary_environment(self) -> None:
+        real_migrations = file_tree(MIGRATIONS_ROOT)
+        copied_root = Path(self.temp_dir.name) / "empty-environment"
+        copied_migrations = copied_root / "migrations"
+        copied_versions = copied_migrations / "versions"
+        copied_versions.mkdir(parents=True)
+        shutil.copyfile(PROJECT_ROOT / "alembic.ini", copied_root / "alembic.ini")
+        shutil.copyfile(MIGRATIONS_ROOT / "env.py", copied_migrations / "env.py")
+        shutil.copyfile(MIGRATIONS_ROOT / "script.py.mako", copied_migrations / "script.py.mako")
+
+        result = run_alembic(
+            self.url,
+            "revision",
+            "--autogenerate",
+            "-m",
+            "generated base schema check",
+            config_path=copied_root / "alembic.ini",
+            cwd=copied_root,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        generated_files = list(copied_versions.glob("*.py"))
+        self.assertEqual(len(generated_files), 1)
+        lint = subprocess.run(
+            [str(Path(sys.executable).with_name("ruff")), "check", str(generated_files[0])],
+            cwd=PROJECT_ROOT,
+            env=isolated_environment(self.url),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(lint.returncode, 0, lint.stdout + lint.stderr)
         self.assertEqual(file_tree(MIGRATIONS_ROOT), real_migrations)
 
 
@@ -334,7 +479,7 @@ class MigrationConfigurationTests(unittest.TestCase):
         self.path = Path(self.temp_dir.name) / "bot.db"
         self.url = f"sqlite+aiosqlite:///{self.path}"
 
-    def test_alembic_upgrade_works_without_bot_token(self) -> None:
+    def test_alembic_upgrade_works_without_bot_token_or_city_id(self) -> None:
         result = run_alembic(self.url, "upgrade", "head")
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -344,6 +489,9 @@ class MigrationConfigurationTests(unittest.TestCase):
             self.assertEqual(
                 connection.scalar(text("SELECT version_num FROM alembic_version")),
                 HEAD_REVISION,
+            )
+            self.assertEqual(
+                connection.scalar(text("SELECT count(*) FROM poweron_source_state")), 0
             )
 
     def test_database_url_environment_override_is_honored(self) -> None:

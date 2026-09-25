@@ -1,5 +1,3 @@
-"""Run migrations against the application database URL."""
-
 import asyncio
 from logging.config import fileConfig
 

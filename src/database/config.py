@@ -1,5 +1,3 @@
-"""Database settings shared by the bot and migration commands."""
-
 import os
 
 from pydantic import Field
