@@ -4,10 +4,14 @@ import asyncio
 import os
 import unittest
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import httpx
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Coroutine
 
 with patch.dict(
     os.environ,
@@ -34,7 +38,14 @@ class GroupResolverTests(unittest.IsolatedAsyncioTestCase):
         self.status = 200
         self.content_type = "application/json"
 
-    def resolver(self, handler=None) -> PowerOnGroupResolver:
+    def resolver(
+        self,
+        handler: (
+            Callable[[httpx.Request], httpx.Response]
+            | Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
+            | None
+        ) = None,
+    ) -> PowerOnGroupResolver:
         def default_handler(request: httpx.Request) -> httpx.Response:
             self.requests.append(request)
             return httpx.Response(
@@ -81,6 +92,8 @@ class GroupResolverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await resolver.ensure_group(), "2.2")
 
         state = await self.state()
+        assert state.last_refresh_attempt_at is not None
+        assert state.last_successful_refresh_at is not None
         self.assertEqual(state.city_id, 21005)
         self.assertEqual(state.group, "2.2")
         self.assertEqual(state.last_refresh_attempt_at.replace(tzinfo=UTC), self.now)
@@ -125,7 +138,7 @@ class GroupResolverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.requests), 2)
 
     async def test_every_invalid_response_retains_last_known_group(self) -> None:
-        failure_cases = (
+        failure_cases: tuple[tuple[str, object, str], ...] = (
             ("content type", {"buildingGroups": [{"chergGpv": "4.1"}]}, "text/html"),
             ("malformed", {"wrong": []}, "application/json"),
             ("invalid group", {"buildingGroups": [{"chergGpv": "bad"}]}, "application/json"),

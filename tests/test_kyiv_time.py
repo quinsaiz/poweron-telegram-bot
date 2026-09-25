@@ -1,12 +1,19 @@
+from __future__ import annotations
+
 import os
 import time
 import unittest
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
+from aiogram import types
 from src.domain_time import KYIV_TZ, as_kyiv
 from src.poweron.utils import get_current_status
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 with patch.dict(
     os.environ,
@@ -97,20 +104,26 @@ class KyivTimeTests(unittest.TestCase):
 
 
 class HandlerKyivDateTests(unittest.IsolatedAsyncioTestCase):
-    async def call_handler(self, handler, now: datetime) -> datetime:
+    async def call_handler(
+        self, handler: Callable[[types.Message], Awaitable[None]], now: datetime
+    ) -> datetime:
         service = SimpleNamespace(get_formatted_schedule=AsyncMock(return_value=("schedule", True)))
-        message = SimpleNamespace(
-            from_user=SimpleNamespace(id=123),
-            answer=AsyncMock(),
+        message = types.Message.model_construct(
+            message_id=1,
+            date=now,
+            chat=types.Chat(id=123, type="private"),
+            from_user=types.User(id=123, is_bot=False, first_name="Test"),
         )
         with (
             patch.object(handlers, "PowerService", return_value=service),
             patch.object(handlers, "kyiv_now", return_value=as_kyiv(now)),
+            patch.object(types.Message, "answer", new_callable=AsyncMock),
         ):
             await handler(message)
 
         service.get_formatted_schedule.assert_awaited_once()
         requested = service.get_formatted_schedule.await_args.args[1]
+        assert isinstance(requested, datetime)
         self.assertIs(requested.tzinfo, KYIV_TZ)
         return requested
 

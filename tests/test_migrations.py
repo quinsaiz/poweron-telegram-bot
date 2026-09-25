@@ -100,6 +100,7 @@ class StandardAlembicTests(unittest.TestCase):
         with self.engine.connect() as connection:
             revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
         self.assertIsInstance(revision, str)
+        assert isinstance(revision, str)
         return revision
 
     def test_exactly_one_head_and_one_revision(self) -> None:
@@ -412,7 +413,9 @@ class StandardAlembicTests(unittest.TestCase):
             "temporary_generated_revision", generated_path
         )
         self.assertIsNotNone(spec)
+        assert spec is not None
         self.assertIsNotNone(spec.loader)
+        assert spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         self.assertIsInstance(module.revision, str)

@@ -20,25 +20,26 @@ with patch.dict(
     },
 ):
     from src import main
-    from src.poweron.groups import SourceIdentityError
+    from src.poweron.groups import SourceIdentityError, group_resolver
     from src.poweron.scheduler import (
         ScheduleScheduler,
         StartupGroupRefreshState,
         check_updates_loop,
     )
+    from src.poweron.service import PowerService
     from src.telegram.middlewares import AntiFloodMiddleware
 
 
 class FakeDispatcher:
-    def __init__(self):
+    def __init__(self) -> None:
         self.started = asyncio.Event()
         self.stopped = asyncio.Event()
         self.polling_finished = asyncio.Event()
-        self.options = None
+        self.options: dict[str, object] | None = None
         self.stop_calls = 0
-        self.polling_task = None
+        self.polling_task: asyncio.Task[object] | None = None
 
-    async def start_polling(self, _bot, **options):
+    async def start_polling(self, _bot: Bot, **options: object) -> None:
         self.options = options
         self.polling_task = asyncio.current_task()
         self.started.set()
@@ -47,14 +48,14 @@ class FakeDispatcher:
         finally:
             self.polling_finished.set()
 
-    async def stop_polling(self):
+    async def stop_polling(self) -> None:
         self.stop_calls += 1
         self.stopped.set()
         await self.polling_finished.wait()
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
+    async def asyncSetUp(self) -> None:
         self.patches = ExitStack()
         self.addCleanup(self.patches.close)
         self.dispatcher = FakeDispatcher()
@@ -62,10 +63,12 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.engine = SimpleNamespace(dispose=AsyncMock())
         self.monitor_started = asyncio.Event()
         self.monitor_finished = asyncio.Event()
-        self.monitor_task = None
-        self.monitor_refresh_state = None
+        self.monitor_task: asyncio.Task[object] | None = None
+        self.monitor_refresh_state: StartupGroupRefreshState | None = None
 
-        async def monitor(_bot, *, startup_group_refresh_state):
+        async def monitor(
+            _bot: Bot, *, startup_group_refresh_state: StartupGroupRefreshState
+        ) -> None:
             self.monitor_task = asyncio.current_task()
             self.monitor_refresh_state = startup_group_refresh_state
             self.monitor_started.set()
@@ -81,24 +84,28 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.patches.enter_context(patch.object(main, "engine", self.engine))
         self.patches.enter_context(patch.object(main, "check_updates_loop", monitor))
         self.ensure_source_identity = self.patches.enter_context(
-            patch.object(main.group_resolver, "ensure_source_identity", new_callable=AsyncMock)
+            patch.object(group_resolver, "ensure_source_identity", new_callable=AsyncMock)
         )
         self.ensure_group = self.patches.enter_context(
             patch.object(
-                main.group_resolver,
+                group_resolver,
                 "ensure_group",
                 new_callable=AsyncMock,
                 return_value="2.2",
             )
         )
 
-    async def test_shutdown_stops_polling_cancels_scheduler_and_closes_resources(self):
+    async def test_shutdown_stops_polling_cancels_scheduler_and_closes_resources(self) -> None:
         with self.assertNoLogs(main.logger, level="ERROR"):
             async with main.lifespan(main.app):
                 await self.dispatcher.started.wait()
                 await self.monitor_started.wait()
+                assert self.monitor_task is not None
                 self.assertFalse(self.monitor_task.done())
 
+        assert self.dispatcher.options is not None
+        assert self.dispatcher.polling_task is not None
+        assert self.monitor_task is not None
         self.assertFalse(self.dispatcher.options["handle_signals"])
         self.assertFalse(self.dispatcher.options["close_bot_session"])
         self.assertEqual(self.dispatcher.stop_calls, 1)
@@ -112,7 +119,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.session.close.assert_awaited_once_with()
         self.engine.dispose.assert_awaited_once_with()
 
-    async def test_source_mismatch_fails_before_workers_start(self):
+    async def test_source_mismatch_fails_before_workers_start(self) -> None:
         self.ensure_source_identity.side_effect = SourceIdentityError("configured city mismatch")
 
         with self.assertRaisesRegex(SourceIdentityError, "city mismatch"):
@@ -123,7 +130,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.monitor_started.is_set())
         self.ensure_group.assert_not_awaited()
 
-    async def test_transient_initial_group_state_failure_still_starts_workers_and_retries(self):
+    async def test_transient_initial_group_state_failure_still_starts_workers_and_retries(
+        self,
+    ) -> None:
         failure = OperationalError("SELECT source state", {}, Exception("temporary"))
         self.ensure_group.side_effect = [failure, "2.2"]
         wait_started = asyncio.Event()
@@ -140,14 +149,16 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Event().wait()
             return 0
 
-        async def retrying_monitor(_bot, *, startup_group_refresh_state):
+        async def retrying_monitor(
+            _bot: Bot, *, startup_group_refresh_state: StartupGroupRefreshState
+        ) -> None:
             self.monitor_task = asyncio.current_task()
             self.monitor_refresh_state = startup_group_refresh_state
             self.monitor_started.set()
             try:
                 scheduler = ScheduleScheduler(
                     _bot,
-                    service=SimpleNamespace(group_resolver=main.group_resolver),
+                    service=PowerService(resolver=group_resolver),
                     sleep=controlled_wait,
                 )
                 with (
@@ -181,7 +192,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.session.close.assert_awaited_once_with()
         self.engine.dispose.assert_awaited_once_with()
 
-    async def test_initial_group_refresh_cancellation_is_not_swallowed(self):
+    async def test_initial_group_refresh_cancellation_is_not_swallowed(self) -> None:
         self.ensure_group.side_effect = asyncio.CancelledError
 
         with self.assertRaises(asyncio.CancelledError):
@@ -193,7 +204,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.session.close.assert_awaited_once_with()
         self.engine.dispose.assert_awaited_once_with()
 
-    async def test_invalid_request_during_initial_group_refresh_is_fatal(self):
+    async def test_invalid_request_during_initial_group_refresh_is_fatal(self) -> None:
         self.ensure_group.side_effect = InvalidRequestError("broken session state")
 
         with self.assertRaisesRegex(InvalidRequestError, "broken session state"):
@@ -205,7 +216,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.session.close.assert_awaited_once_with()
         self.engine.dispose.assert_awaited_once_with()
 
-    async def test_argument_error_during_initial_group_refresh_is_fatal(self):
+    async def test_argument_error_during_initial_group_refresh_is_fatal(self) -> None:
         self.ensure_group.side_effect = ArgumentError("invalid statement construction")
 
         with self.assertRaisesRegex(ArgumentError, "invalid statement construction"):
@@ -217,12 +228,12 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.session.close.assert_awaited_once_with()
         self.engine.dispose.assert_awaited_once_with()
 
-    async def test_shutdown_is_bounded_when_polling_ignores_stop_request(self):
-        async def stuck_stop():
+    async def test_shutdown_is_bounded_when_polling_ignores_stop_request(self) -> None:
+        async def stuck_stop() -> None:
             self.dispatcher.stop_calls += 1
             await asyncio.Event().wait()
 
-        self.dispatcher.stop_polling = stuck_stop
+        self.patches.enter_context(patch.object(self.dispatcher, "stop_polling", stuck_stop))
         self.patches.enter_context(patch.object(main, "POLLING_STOP_TIMEOUT", 0.01))
         self.patches.enter_context(patch.object(main, "WORKER_SHUTDOWN_TIMEOUT", 0.06))
         loop = asyncio.get_running_loop()
@@ -231,7 +242,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         loop.set_exception_handler(lambda _loop, context: warnings.append(context))
         self.addCleanup(loop.set_exception_handler, previous_handler)
 
-        async def run_lifespan():
+        async def run_lifespan() -> None:
             async with main.lifespan(main.app):
                 await self.dispatcher.started.wait()
                 await self.monitor_started.wait()
@@ -241,16 +252,17 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.dispatcher.stop_calls, 1)
         self.assertTrue(self.dispatcher.polling_finished.is_set())
+        assert self.dispatcher.polling_task is not None
         self.assertTrue(self.dispatcher.polling_task.done())
         self.assertTrue(self.monitor_finished.is_set())
         self.session.close.assert_awaited_once_with()
         self.engine.dispose.assert_awaited_once_with()
         self.assertEqual(warnings, [])
 
-    async def test_pending_worker_is_fatal_and_resources_stay_open(self):
+    async def test_pending_worker_is_fatal_and_resources_stay_open(self) -> None:
         release = asyncio.Event()
 
-        async def stubborn_polling(_bot, **options):
+        async def stubborn_polling(_bot: Bot, **options: object) -> None:
             self.dispatcher.options = options
             self.dispatcher.polling_task = asyncio.current_task()
             self.dispatcher.started.set()
@@ -261,11 +273,11 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 self.dispatcher.polling_finished.set()
 
-        self.dispatcher.start_polling = stubborn_polling
+        self.patches.enter_context(patch.object(self.dispatcher, "start_polling", stubborn_polling))
         self.patches.enter_context(patch.object(main, "POLLING_STOP_TIMEOUT", 0.01))
         self.patches.enter_context(patch.object(main, "WORKER_SHUTDOWN_TIMEOUT", 0.06))
 
-        async def run_lifespan():
+        async def run_lifespan() -> None:
             async with main.lifespan(main.app):
                 await self.dispatcher.started.wait()
                 await self.monitor_started.wait()
@@ -281,6 +293,8 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 any(isinstance(error, TimeoutError) for error in caught.exception.exceptions)
             )
             self.assertIn("Worker shutdown deadline exceeded", logs.output[0])
+            assert self.dispatcher.polling_task is not None
+            assert self.monitor_task is not None
             self.assertFalse(self.dispatcher.polling_task.done())
             self.assertTrue(self.monitor_task.done())
             self.session.close.assert_not_awaited()
@@ -290,10 +304,13 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             if self.dispatcher.polling_task is not None:
                 await asyncio.wait_for(self.dispatcher.polling_task, timeout=0.5)
 
+        assert self.dispatcher.polling_task is not None
         self.assertTrue(self.dispatcher.polling_task.done())
 
-    async def test_unexpected_scheduler_failure_is_reported_after_cleanup(self):
-        async def failed_monitor(_bot, *, startup_group_refresh_state):
+    async def test_unexpected_scheduler_failure_is_reported_after_cleanup(self) -> None:
+        async def failed_monitor(
+            _bot: Bot, *, startup_group_refresh_state: StartupGroupRefreshState
+        ) -> None:
             self.assertIs(startup_group_refresh_state, StartupGroupRefreshState.SUCCEEDED)
             raise ValueError("scheduler failed")
 
@@ -310,12 +327,12 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RuntimeHealthTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
+    async def asyncSetUp(self) -> None:
         self.previous_health = main.app.state.runtime_health
         main.app.state.runtime_health = main.RuntimeHealth()
         self.addAsyncCleanup(self._restore_health)
 
-    async def _restore_health(self):
+    async def _restore_health(self) -> None:
         health = main.app.state.runtime_health
         health.shutdown_started = True
         for task in (health.polling_task, health.scheduler_task):
@@ -380,19 +397,19 @@ class RuntimeHealthTests(unittest.IsolatedAsyncioTestCase):
         await scheduler_started.wait()
         return health, release
 
-    async def test_liveness_is_independent_of_worker_readiness(self):
+    async def test_liveness_is_independent_of_worker_readiness(self) -> None:
         response = await self._get("/health/live")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "alive"})
 
-    async def test_readiness_is_unavailable_before_startup_completes(self):
+    async def test_readiness_is_unavailable_before_startup_completes(self) -> None:
         response = await self._get("/health/ready")
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["components"]["application"], "starting")
 
-    async def test_running_workers_are_ready_and_root_is_truthful(self):
+    async def test_running_workers_are_ready_and_root_is_truthful(self) -> None:
         await self._running_health()
 
         ready = await self._get("/health/ready")
@@ -406,10 +423,11 @@ class RuntimeHealthTests(unittest.IsolatedAsyncioTestCase):
             {"status": "ok", "bot": "running", "scheduler": "running"},
         )
 
-    async def test_completed_polling_task_makes_readiness_unavailable(self):
+    async def test_completed_polling_task_makes_readiness_unavailable(self) -> None:
         health, release = await self._health_with_completing_worker("polling")
         release.set()
         with self.assertLogs(main.logger, level="ERROR") as logs:
+            assert health.polling_task is not None
             await health.polling_task
             response = await self._get("/health/ready")
             root = await self._get("/")
@@ -420,17 +438,18 @@ class RuntimeHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json()["components"]["telegram_polling"], "stopped")
         self.assertIn("Telegram polling stopped unexpectedly", "\n".join(logs.output))
 
-    async def test_completed_scheduler_task_makes_readiness_unavailable(self):
+    async def test_completed_scheduler_task_makes_readiness_unavailable(self) -> None:
         health, release = await self._health_with_completing_worker("scheduler")
         release.set()
         with self.assertLogs(main.logger, level="ERROR"):
+            assert health.scheduler_task is not None
             await health.scheduler_task
             response = await self._get("/health/ready")
 
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json()["components"]["scheduler"], "stopped")
 
-    async def test_failed_worker_is_logged_once_and_detail_is_not_exposed(self):
+    async def test_failed_worker_is_logged_once_and_detail_is_not_exposed(self) -> None:
         secret = "private-worker-detail"
 
         async def fail(started: asyncio.Event, release: asyncio.Event) -> None:
@@ -463,7 +482,7 @@ class RuntimeHealthTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
-    async def test_shutdown_in_progress_is_unavailable(self):
+    async def test_shutdown_in_progress_is_unavailable(self) -> None:
         health = await self._running_health()
         health.shutdown_started = True
 
@@ -475,14 +494,14 @@ class RuntimeHealthTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RuntimeAnnotationTests(unittest.TestCase):
-    def test_lifespan_annotations_can_be_inspected(self):
+    def test_lifespan_annotations_can_be_inspected(self) -> None:
         signature = inspect.signature(main.lifespan)
         self.assertIn("_", signature.parameters)
         self.assertIn("return", main.lifespan.__annotations__)
 
-    def test_scheduler_annotations_can_be_evaluated(self):
+    def test_scheduler_annotations_can_be_evaluated(self) -> None:
         self.assertIs(get_type_hints(check_updates_loop)["bot"], Bot)
         self.assertIs(inspect.get_annotations(check_updates_loop, eval_str=True)["bot"], Bot)
 
-    def test_middleware_annotations_can_be_evaluated(self):
+    def test_middleware_annotations_can_be_evaluated(self) -> None:
         self.assertIn("handler", get_type_hints(AntiFloodMiddleware.__call__))

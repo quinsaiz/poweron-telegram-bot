@@ -6,9 +6,9 @@ import os
 import time
 import unittest
 from datetime import UTC, date, datetime, timedelta
-from types import SimpleNamespace
+from functools import partial
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 from poweron_live_fixtures import (
@@ -31,10 +31,14 @@ with patch.dict(
 ):
     from src.poweron import service as service_module
 
+from src.config import settings
 from src.database.models import Base, PowerOnSourceState, ScheduleCache, User
+from src.poweron.groups import PowerOnGroupResolver
+from src.poweron.schemas import ScheduleResponse
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from contextlib import AbstractContextManager
 
 
 class DiscoveryFetchWindowTests(unittest.IsolatedAsyncioTestCase):
@@ -49,9 +53,9 @@ class DiscoveryFetchWindowTests(unittest.IsolatedAsyncioTestCase):
         transport = httpx.MockTransport(respond)
         service = service_module.PowerService(clock=clock)
         with patch.object(
-            service_module.httpx,
+            httpx,
             "AsyncClient",
-            side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
+            side_effect=partial(real_client, transport=transport),
         ):
             result = await service.fetch_schedule("3.2")
 
@@ -92,7 +96,11 @@ class DiscoveryFetchWindowTests(unittest.IsolatedAsyncioTestCase):
 
         for name, now, expected_after, expected_before, expected_dates in cases:
             with self.subTest(name=name):
-                params, relevant_dates = await self.fetch(lambda now=now: now)
+
+                def fixed_clock(now: datetime = now) -> datetime:
+                    return now
+
+                params, relevant_dates = await self.fetch(fixed_clock)
                 self.assertEqual(params["after"], expected_after)
                 self.assertEqual(params["before"], expected_before)
                 self.assertEqual(relevant_dates, expected_dates)
@@ -158,7 +166,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
     chat_id = 12345
     group = "3.2"
 
-    async def asyncSetUp(self):
+    async def asyncSetUp(self) -> None:
         self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
@@ -176,15 +184,19 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.session_patch = patch.object(service_module, "async_session", self.session)
         self.session_patch.start()
         self.addCleanup(self.session_patch.stop)
-        self.resolver = SimpleNamespace(ensure_group=AsyncMock(return_value=self.group))
+        self.resolver = PowerOnGroupResolver(session_factory=self.session)
+        self.ensure_group = AsyncMock(return_value=self.group)
+        resolver_patch = patch.object(self.resolver, "ensure_group", self.ensure_group)
+        resolver_patch.start()
+        self.addCleanup(resolver_patch.stop)
         self.service = service_module.PowerService(resolver=self.resolver)
-        self.requests = []
+        self.requests: list[httpx.Request] = []
 
-    async def asyncTearDown(self):
+    async def asyncTearDown(self) -> None:
         await self.engine.dispose()
 
-    async def add_user(self, group="3.2"):
-        self.resolver.ensure_group.return_value = group
+    async def add_user(self, group: str = "3.2") -> None:
+        self.ensure_group.return_value = group
         async with self.session() as session:
             state = await session.get(PowerOnSourceState, 1)
             assert state is not None
@@ -193,13 +205,15 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
     async def set_authoritative_group(self, group: str) -> None:
-        self.resolver.ensure_group.return_value = group
+        self.ensure_group.return_value = group
         async with self.session() as session, session.begin():
             state = await session.get(PowerOnSourceState, 1)
             assert state is not None
             state.group = group
 
-    async def add_cache(self, date_str=None, group="3.2", age_minutes=31):
+    async def add_cache(
+        self, date_str: str | None = None, group: str = "3.2", age_minutes: int = 31
+    ) -> None:
         async with self.session() as session:
             session.add(
                 ScheduleCache(
@@ -211,10 +225,18 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             )
             await session.commit()
 
-    def mock_api(self, *, times=None, error=False, date_graph=None, group=None, payload=None):
+    def mock_api(
+        self,
+        *,
+        times: dict[str, str] | None = None,
+        error: bool = False,
+        date_graph: str | None = None,
+        group: str | None = None,
+        payload: object | None = None,
+    ) -> None:
         real_client = httpx.AsyncClient
 
-        def respond(request):
+        def respond(request: httpx.Request) -> httpx.Response:
             self.requests.append(request)
             if error:
                 raise httpx.ConnectError("upstream unavailable", request=request)
@@ -235,14 +257,16 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
 
         transport = httpx.MockTransport(respond)
         client_patch = patch.object(
-            service_module.httpx,
+            httpx,
             "AsyncClient",
-            side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
+            side_effect=partial(real_client, transport=transport),
         )
         client_patch.start()
         self.addCleanup(client_patch.stop)
 
-    def isolated_api(self, *, times, group):
+    def isolated_api(
+        self, *, times: dict[str, str], group: str
+    ) -> AbstractContextManager[MagicMock]:
         real_client = httpx.AsyncClient
         payload = {
             "hydra:member": [
@@ -257,18 +281,18 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
 
-        def respond(request):
+        def respond(request: httpx.Request) -> httpx.Response:
             self.requests.append(request)
             return httpx.Response(200, json=payload)
 
         transport = httpx.MockTransport(respond)
         return patch.object(
-            service_module.httpx,
+            httpx,
             "AsyncClient",
-            side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
+            side_effect=partial(real_client, transport=transport),
         )
 
-    async def test_fresh_cache_does_not_request_upstream(self):
+    async def test_fresh_cache_does_not_request_upstream(self) -> None:
         await self.add_user()
         await self.add_cache(age_minutes=1)
         self.mock_api(error=True)
@@ -279,8 +303,8 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🟢 Є світло", text)
         self.assertEqual(self.requests, [])
 
-    async def test_unavailable_group_does_not_request_schedule(self):
-        self.resolver.ensure_group.return_value = None
+    async def test_unavailable_group_does_not_request_schedule(self) -> None:
+        self.ensure_group.return_value = None
         self.mock_api(error=True)
 
         text, ok = await self.service.get_formatted_schedule(self.chat_id, self.date)
@@ -289,7 +313,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Інформація про групу тимчасово недоступна", text)
         self.assertEqual(self.requests, [])
 
-    async def test_group_change_does_not_read_fresh_cache_for_old_group(self):
+    async def test_group_change_does_not_read_fresh_cache_for_old_group(self) -> None:
         await self.add_cache(group="3.2", age_minutes=1)
         await self.set_authoritative_group("4.1")
         self.mock_api(times={"00:00": "1"}, group="4.1")
@@ -307,10 +331,12 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         fetch_started = asyncio.Event()
         release_fetch = asyncio.Event()
 
-        async def fetch(_group: str, _date: datetime | None = None):
+        async def fetch(
+            _group: str, _date: datetime | None = None
+        ) -> service_module.ScheduleFetchResult:
             fetch_started.set()
             await release_fetch.wait()
-            response = service_module.ScheduleResponse.model_validate(
+            response = ScheduleResponse.model_validate(
                 {
                     "hydra:member": [
                         {
@@ -335,7 +361,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             await self.service.get_schedule_from_cache(self.date_str, "3.2"), (None, None)
         )
 
-    async def test_expired_cache_is_refreshed_and_persisted(self):
+    async def test_expired_cache_is_refreshed_and_persisted(self) -> None:
         await self.add_user()
         await self.add_cache()
         self.mock_api(times={"00:00": "1", "12:30": "10"})
@@ -359,7 +385,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             cache = (await session.execute(select(ScheduleCache))).scalar_one()
         self.assertEqual(json.loads(cache.times_json), {"00:00": "1", "12:30": "10"})
 
-    async def test_expired_cache_is_used_when_upstream_fails(self):
+    async def test_expired_cache_is_used_when_upstream_fails(self) -> None:
         await self.add_user()
         await self.add_cache()
         self.mock_api(error=True)
@@ -370,7 +396,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🟢 Є світло", text)
         self.assertEqual(len(self.requests), 1)
 
-    async def test_failed_commit_rolls_back_before_stale_fallback(self):
+    async def test_failed_commit_rolls_back_before_stale_fallback(self) -> None:
         await self.add_user()
         await self.add_cache()
         self.mock_api(times={"00:00": "1"})
@@ -383,19 +409,21 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         original_rollback = AsyncSession.rollback
         original_lookup = self.service.get_schedule_from_cache
 
-        async def fail_commit(session):
+        async def fail_commit(session: AsyncSession) -> None:
             await session.flush()
             failed_commit.append(True)
             raise OperationalError("UPDATE schedule_cache", {}, Exception("simulated"))
 
-        async def track_rollback(session):
+        async def track_rollback(session: AsyncSession) -> None:
             rollbacks.append(True)
             await original_rollback(session)
 
-        async def check_lookup(*args, **kwargs):
+        async def check_lookup(
+            date_graph: str, group: str, allow_stale: bool = False
+        ) -> tuple[dict[str, str] | None, datetime | None]:
             if failed_commit:
                 self.assertTrue(rollbacks)
-            return await original_lookup(*args, **kwargs)
+            return await original_lookup(date_graph, group, allow_stale=allow_stale)
 
         with (
             patch.object(AsyncSession, "commit", fail_commit),
@@ -414,11 +442,11 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(cache.times_json), {"00:00": "0"})
         self.assertEqual(cache.updated_at, original_updated_at)
 
-    async def test_failed_commit_without_stale_cache_keeps_no_schedule_result(self):
+    async def test_failed_commit_without_stale_cache_keeps_no_schedule_result(self) -> None:
         await self.add_user()
         self.mock_api(times={"00:00": "1"})
 
-        async def fail_commit(session):
+        async def fail_commit(session: AsyncSession) -> None:
             await session.flush()
             raise OperationalError("INSERT schedule_cache", {}, Exception("simulated"))
 
@@ -431,7 +459,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             rows = (await session.execute(select(ScheduleCache))).scalars().all()
         self.assertEqual(rows, [])
 
-    async def test_cold_cache_preserves_no_schedule_result_on_failure(self):
+    async def test_cold_cache_preserves_no_schedule_result_on_failure(self) -> None:
         await self.add_user()
         self.mock_api(error=True)
 
@@ -441,7 +469,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text, "❌ **Графіка на 15 січня ще немає**")
         self.assertEqual(len(self.requests), 1)
 
-    async def test_live_empty_payload_returns_no_schedule_without_error_logging(self):
+    async def test_live_empty_payload_returns_no_schedule_without_error_logging(self) -> None:
         await self.add_user()
         self.mock_api(payload={"hydra:totalItems": 0, "hydra:member": None})
 
@@ -462,7 +490,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             rows = (await session.execute(select(ScheduleCache))).scalars().all()
         self.assertEqual(rows, [])
 
-    async def test_live_empty_payload_keeps_matching_stale_cache(self):
+    async def test_live_empty_payload_keeps_matching_stale_cache(self) -> None:
         await self.add_user()
         await self.add_cache()
         self.mock_api(payload={"hydra:totalItems": 0, "hydra:member": None})
@@ -476,7 +504,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             cache = (await session.execute(select(ScheduleCache))).scalar_one()
         self.assertEqual(json.loads(cache.times_json), {"00:00": "0"})
 
-    async def test_live_z_event_refreshes_exact_date_and_group_cache(self):
+    async def test_live_z_event_refreshes_exact_date_and_group_cache(self) -> None:
         await self.add_user(group=LIVE_GROUP)
         self.mock_api(payload=live_collection())
         requested = datetime.combine(LIVE_EVENT_DATE, datetime.min.time(), tzinfo=UTC)
@@ -497,7 +525,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cache.group, LIVE_GROUP)
         self.assertEqual(json.loads(cache.times_json), live_half_hour_times())
 
-    async def test_stale_cache_never_crosses_group_or_date(self):
+    async def test_stale_cache_never_crosses_group_or_date(self) -> None:
         await self.add_user(group="4.1")
         await self.add_cache(group="3.2")
         await self.add_cache(date_str="2024-01-14", group="4.1")
@@ -508,7 +536,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok)
         self.assertEqual(text, "❌ **Графіка на 15 січня ще немає**")
 
-    async def test_unusable_upstream_data_uses_matching_stale_cache(self):
+    async def test_unusable_upstream_data_uses_matching_stale_cache(self) -> None:
         await self.add_user()
         await self.add_cache()
         self.mock_api(times={})
@@ -519,7 +547,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🟢 Є світло", text)
         self.assertEqual(len(self.requests), 1)
 
-    async def test_malformed_time_does_not_replace_stale_cache(self):
+    async def test_malformed_time_does_not_replace_stale_cache(self) -> None:
         await self.add_user()
         await self.add_cache()
         self.mock_api(times={"00:00": "1", "not-a-time": "1"})
@@ -532,7 +560,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             cache = (await session.execute(select(ScheduleCache))).scalar_one()
         self.assertEqual(json.loads(cache.times_json), {"00:00": "0"})
 
-    async def test_24_00_start_is_rejected_without_cache_save(self):
+    async def test_24_00_start_is_rejected_without_cache_save(self) -> None:
         await self.add_user()
         await self.add_cache()
         self.mock_api(times={"24:00": "1"})
@@ -549,7 +577,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             cache = (await session.execute(select(ScheduleCache))).scalar_one()
         self.assertEqual(json.loads(cache.times_json), {"00:00": "0"})
 
-    async def test_23_59_start_remains_valid(self):
+    async def test_23_59_start_remains_valid(self) -> None:
         await self.add_user()
         self.mock_api(times={"23:59": "1"})
 
@@ -561,7 +589,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             cache = (await session.execute(select(ScheduleCache))).scalar_one()
         self.assertEqual(json.loads(cache.times_json), {"23:59": "1"})
 
-    async def test_invalid_start_keys_never_replace_stale_cache(self):
+    async def test_invalid_start_keys_never_replace_stale_cache(self) -> None:
         target_group = "4.1"
         await self.add_user(group=target_group)
         invalid_keys = ("0:00", "00:0", "23:60", "24:00", "٠٠:٠٠", "１２:００")
@@ -618,7 +646,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(request.url.params["before"], "2024-01-16T12:00:00+00:00")
                 self.assertEqual(
                     request.url.params["time"],
-                    str(service_module.settings.POWERON_CITY_ID),
+                    str(settings.POWERON_CITY_ID),
                 )
                 self.assertEqual(request.url.params.get_list("group[]"), [target_group])
                 self.assertEqual(actual, expected)
@@ -642,7 +670,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
                     original,
                 )
 
-    async def test_valid_start_boundaries_are_persisted(self):
+    async def test_valid_start_boundaries_are_persisted(self) -> None:
         target_group = "4.1"
         await self.add_user(group=target_group)
         for key in ("00:00", "09:05", "23:59"):
@@ -673,7 +701,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(cache.group, target_group)
                 self.assertEqual(json.loads(cache.times_json), {key: "1"})
 
-    async def test_unsupported_status_does_not_replace_stale_cache(self):
+    async def test_unsupported_status_does_not_replace_stale_cache(self) -> None:
         await self.add_user()
         await self.add_cache()
         self.mock_api(times={"00:00": "1", "12:30": "9"})
@@ -686,7 +714,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             cache = (await session.execute(select(ScheduleCache))).scalar_one()
         self.assertEqual(json.loads(cache.times_json), {"00:00": "0"})
 
-    async def test_other_date_from_upstream_does_not_fill_cold_cache(self):
+    async def test_other_date_from_upstream_does_not_fill_cold_cache(self) -> None:
         await self.add_user()
         self.mock_api(times={"00:00": "1"}, date_graph="2024-01-14")
 
@@ -698,7 +726,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             rows = (await session.execute(select(ScheduleCache))).scalars().all()
         self.assertEqual(rows, [])
 
-    async def test_successful_refresh_preserves_other_group_for_same_date(self):
+    async def test_successful_refresh_preserves_other_group_for_same_date(self) -> None:
         await self.add_user()
         await self.add_cache(group="4.1")
         self.mock_api(times={"00:00": "1"})
@@ -714,7 +742,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             {"3.2": {"00:00": "1"}, "4.1": {"00:00": "0"}},
         )
 
-    async def test_refresh_selects_non_default_user_group(self):
+    async def test_refresh_selects_non_default_user_group(self) -> None:
         await self.add_user(group="4.1")
         self.mock_api(times={"00:00": "1"}, group="4.1")
 

@@ -1,9 +1,15 @@
+from __future__ import annotations
+
 import logging
 import os
 import unittest
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 from pydantic import ValidationError
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 with patch.dict(
     os.environ,
@@ -20,15 +26,21 @@ with patch.dict(
 
 
 class SettingsTests(unittest.TestCase):
-    def settings(self, **overrides):
-        values = {
-            "BOT_TOKEN": "123:test-only-token",
-            "POWERON_CITY_ID": 21005,
-            "POWERON_API_URL": "https://api-poweron.toe.com.ua/api/",
-            "LOG_LEVEL": "INFO",
-        }
-        values.update(overrides)
-        return Settings(_env_file=None, **values)
+    def settings(
+        self,
+        *,
+        BOT_TOKEN: str = "123:test-only-token",
+        POWERON_CITY_ID: int = 21005,
+        POWERON_API_URL: str = "https://api-poweron.toe.com.ua/api/",
+        LOG_LEVEL: str = "INFO",
+    ) -> Settings:
+        return Settings(
+            _env_file=None,
+            BOT_TOKEN=BOT_TOKEN,
+            POWERON_CITY_ID=POWERON_CITY_ID,
+            POWERON_API_URL=POWERON_API_URL,
+            LOG_LEVEL=LOG_LEVEL,
+        )
 
     def test_valid_settings_are_normalized_without_revealing_token(self) -> None:
         configured = self.settings(LOG_LEVEL="warning")
@@ -112,7 +124,7 @@ class SettingsTests(unittest.TestCase):
             self.settings(LOG_LEVEL="verbose")
 
     def test_validation_errors_hide_sensitive_input_values(self) -> None:
-        cases = (
+        cases: tuple[tuple[str, Callable[[], object], str, str], ...] = (
             (
                 "URL credentials",
                 lambda: self.settings(
@@ -131,7 +143,13 @@ class SettingsTests(unittest.TestCase):
             ),
             (
                 "bot token",
-                lambda: self.settings(BOT_TOKEN={"secret": "BOT_SECRET_NEVER_PRINT"}),
+                lambda: Settings.model_validate(
+                    {
+                        "BOT_TOKEN": {"secret": "BOT_SECRET_NEVER_PRINT"},
+                        "POWERON_CITY_ID": 21005,
+                        "POWERON_API_URL": "https://api-poweron.toe.com.ua/api/",
+                    }
+                ),
                 "BOT_SECRET_NEVER_PRINT",
                 "BOT_TOKEN",
             ),

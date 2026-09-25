@@ -7,11 +7,11 @@ import tempfile
 import unittest
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from aiogram import Bot
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramForbiddenError,
@@ -82,6 +82,15 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
     event_date = date(2026, 9, 22)
     date_graph = "2026-09-22T00:00:00+03:00"
 
+    def mocked_bot(self) -> tuple[Bot, AsyncMock]:
+        bot = Bot(TEST_BOT_TOKEN)
+        self.addAsyncCleanup(bot.session.close)
+        send_message = AsyncMock(return_value=object())
+        send_patch = patch.object(bot, "send_message", send_message)
+        send_patch.start()
+        self.addCleanup(send_patch.stop)
+        return bot, send_message
+
     async def asyncSetUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
@@ -103,13 +112,23 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         self.addAsyncCleanup(self.engine.dispose)
-        self.bot = SimpleNamespace(send_message=AsyncMock(return_value=object()))
-        self.resolver = SimpleNamespace(
-            ensure_group=AsyncMock(return_value="3.2"),
-            ensure_source_identity=AsyncMock(),
+        self.bot, self.send_message_mock = self.mocked_bot()
+        self.resolver = PowerOnGroupResolver(session_factory=self.session)
+        self.ensure_group_mock = AsyncMock(return_value="3.2")
+        group_patch = patch.object(self.resolver, "ensure_group", self.ensure_group_mock)
+        group_patch.start()
+        self.addCleanup(group_patch.stop)
+        self.ensure_source_identity_mock = AsyncMock()
+        identity_patch = patch.object(
+            self.resolver, "ensure_source_identity", self.ensure_source_identity_mock
         )
+        identity_patch.start()
+        self.addCleanup(identity_patch.stop)
         self.service = PowerService(resolver=self.resolver)
-        self.service.fetch_schedule = AsyncMock()  # type: ignore[method-assign]
+        self.fetch_schedule_mock = AsyncMock()
+        fetch_patch = patch.object(self.service, "fetch_schedule", self.fetch_schedule_mock)
+        fetch_patch.start()
+        self.addCleanup(fetch_patch.stop)
         self.scheduler = ScheduleScheduler(
             self.bot,
             service=self.service,
@@ -162,7 +181,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def add_users(self, *users: tuple[int, str]) -> None:
         if users:
-            self.resolver.ensure_group.return_value = users[0][1]
+            self.ensure_group_mock.return_value = users[0][1]
         async with self.session() as session, session.begin():
             if users:
                 state = await session.get(PowerOnSourceState, 1)
@@ -264,7 +283,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_empty_response_creates_nothing(self) -> None:
-        self.service.fetch_schedule.return_value = self.response()
+        self.fetch_schedule_mock.return_value = self.response()
 
         self.assertEqual(await self.scheduler.discover_events(), 0)
         self.assertEqual(await self.events(), [])
@@ -304,10 +323,10 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
         for failure in failures:
             with self.subTest(exception=type(failure).__name__):
-                self.service.fetch_schedule.reset_mock(side_effect=True)
-                self.service.fetch_schedule.side_effect = [failure, asyncio.CancelledError()]
-                self.resolver.ensure_source_identity.reset_mock(side_effect=True)
-                self.resolver.ensure_source_identity.return_value = None
+                self.fetch_schedule_mock.reset_mock(side_effect=True)
+                self.fetch_schedule_mock.side_effect = [failure, asyncio.CancelledError()]
+                self.ensure_source_identity_mock.reset_mock(side_effect=True)
+                self.ensure_source_identity_mock.return_value = None
                 delivery_scan = AsyncMock(return_value=0)
                 normal_wait = AsyncMock(return_value=None)
 
@@ -319,7 +338,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     await self.scheduler.run(StartupGroupRefreshState.SUCCEEDED)
 
-                self.assertEqual(self.service.fetch_schedule.await_count, 2)
+                self.assertEqual(self.fetch_schedule_mock.await_count, 2)
                 normal_wait.assert_awaited_once_with(self.scheduler.poll_interval)
                 self.assertNotIn("fake-secret", "\n".join(logs.output))
                 self.assertEqual([event.event_id for event in await self.events()], original_events)
@@ -350,8 +369,8 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         )
         for failure in failures:
             with self.subTest(exception=type(failure).__name__):
-                self.service.fetch_schedule.reset_mock(side_effect=True)
-                self.service.fetch_schedule.side_effect = failure
+                self.fetch_schedule_mock.reset_mock(side_effect=True)
+                self.fetch_schedule_mock.side_effect = failure
                 with self.assertRaises(type(failure)):
                     await self.scheduler.discover_events()
 
@@ -383,7 +402,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_date_creates_nothing(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(self.event(1, date_graph=None))
+        self.fetch_schedule_mock.return_value = self.response(self.event(1, date_graph=None))
 
         self.assertEqual(await self.scheduler.discover_events(), 0)
         self.assertEqual(await self.events(), [])
@@ -391,11 +410,11 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_discovery_requests_only_the_effective_group(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(self.event(1))
+        self.fetch_schedule_mock.return_value = self.response(self.event(1))
 
         self.assertEqual(await self.scheduler.discover_events(), 1)
 
-        self.service.fetch_schedule.assert_awaited_once_with("3.2")
+        self.fetch_schedule_mock.assert_awaited_once_with("3.2")
 
     async def test_group_change_while_fetch_is_in_flight_rejects_stale_persistence(self) -> None:
         await self.add_users((10, "3.2"))
@@ -409,7 +428,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             await release_fetch.wait()
             return self.response(self.event("stale-a"))
 
-        self.service.fetch_schedule.side_effect = fetch
+        self.fetch_schedule_mock.side_effect = fetch
         discovery = asyncio.create_task(self.scheduler.discover_events())
         await fetch_started.wait()
         self.assertEqual(await self.real_resolver_returning("4.1").ensure_group(), "4.1")
@@ -430,9 +449,9 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delivered.recipient_group, "3.2")
         self.assertEqual(delivered.message, "message-10")
 
-        self.resolver.ensure_group.return_value = "4.1"
-        self.service.fetch_schedule.side_effect = None
-        self.service.fetch_schedule.return_value = self.response(
+        self.ensure_group_mock.return_value = "4.1"
+        self.fetch_schedule_mock.side_effect = None
+        self.fetch_schedule_mock.return_value = self.response(
             self.event("current-b", {"4.1": {"00:00": "1"}})
         )
 
@@ -481,7 +500,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         release_authoritative_write = asyncio.Event()
         group_update_waiting = asyncio.Event()
         commit_order: list[str] = []
-        a_task: asyncio.Task[object] | None = None
+        a_task: asyncio.Future[object] | None = None
         b_task: asyncio.Task[object] | None = None
         original_get = AsyncSession.get
         original_commit = AsyncSession.commit
@@ -505,7 +524,8 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             *args: object,
             **kwargs: object,
         ) -> object:
-            result = await original_get(session, entity, ident, *args, **kwargs)
+            # SQLAlchemy's overloaded generic get cannot type a runtime passthrough wrapper.
+            result = await original_get(session, entity, ident, *args, **kwargs)  # type: ignore[arg-type, func-returns-value]
             if asyncio.current_task() is a_task and entity is PowerOnSourceState:
                 authority_read.set()
                 await release_authoritative_write.wait()
@@ -530,7 +550,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             patch.object(AsyncSession, "get", gated_get),
             patch.object(AsyncSession, "commit", observed_commit),
         ):
-            a_task = asyncio.create_task(write())
+            a_task = asyncio.ensure_future(write())
             try:
                 await asyncio.wait_for(authority_read.wait(), timeout=2.0)
                 b_task = asyncio.create_task(resolver.ensure_group())
@@ -579,15 +599,15 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row.group for row in await self.caches()], ["3.2"])
 
     async def test_cold_group_unavailability_skips_discovery(self) -> None:
-        self.resolver.ensure_group.return_value = None
+        self.ensure_group_mock.return_value = None
 
         self.assertEqual(await self.scheduler.discover_events(), 0)
 
-        self.service.fetch_schedule.assert_not_awaited()
+        self.fetch_schedule_mock.assert_not_awaited()
 
     async def test_date_relevance_uses_the_wire_calendar_date(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(1, date_graph="2026-09-22T00:00:00+00:00")
         )
 
@@ -598,7 +618,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.now = datetime(2026, 4, 10, 9, 0, tzinfo=UTC)
         await self.add_users((10, LIVE_GROUP))
         schedule = ScheduleResponse.model_validate(live_collection())
-        self.service.fetch_schedule.return_value = ScheduleFetchResult(
+        self.fetch_schedule_mock.return_value = ScheduleFetchResult(
             schedule,
             frozenset((LIVE_EVENT_DATE,)),
         )
@@ -621,7 +641,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_subscribed_group_creates_no_event_or_delivery(self) -> None:
         await self.add_users((10, "4.1"))
-        self.service.fetch_schedule.return_value = self.response(self.event(1))
+        self.fetch_schedule_mock.return_value = self.response(self.event(1))
 
         self.assertEqual(await self.scheduler.discover_events(), 0)
         self.assertEqual(await self.events(), [])
@@ -632,7 +652,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         invalid_schedules = ({"24:00": "0"}, {"00:00": "unknown"})
         for index, times in enumerate(invalid_schedules, start=1):
             with self.subTest(times=times):
-                self.service.fetch_schedule.return_value = self.response(
+                self.fetch_schedule_mock.return_value = self.response(
                     self.event(index, {"3.2": times})
                 )
                 self.assertEqual(await self.scheduler.discover_events(), 0)
@@ -642,7 +662,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_every_distinct_usable_event_is_processed(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(10), self.event(4), self.event(77)
         )
 
@@ -652,7 +672,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_incomplete_member_does_not_hide_usable_sibling(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             {"id": "invalid", "dataJson": []}, self.event(8)
         )
 
@@ -661,7 +681,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_event_order_and_nonconsecutive_ids_do_not_change_processing(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event("event-z"),
             self.event("event-a"),
             self.event("event-m"),
@@ -677,7 +697,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_malformed_duplicate_before_valid_duplicate_uses_valid_member(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(1, date_graph=None), self.event(1)
         )
 
@@ -686,7 +706,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_valid_duplicate_before_malformed_duplicate_uses_valid_member(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(1), self.event(1, date_graph="2026-W39-2")
         )
 
@@ -695,7 +715,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_identical_valid_duplicates_are_processed_once(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(self.event(1), self.event(1))
+        self.fetch_schedule_mock.return_value = self.response(self.event(1), self.event(1))
 
         self.assertEqual(await self.scheduler.discover_events(), 1)
         self.assertEqual(len(await self.events()), 1)
@@ -703,7 +723,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_conflicting_valid_duplicates_are_skipped_atomically(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "0"}}),
             self.event(1, {"3.2": {"00:00": "1"}}),
         )
@@ -715,7 +735,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_duplicate_poll_creates_no_duplicate_rows(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(self.event(1))
+        self.fetch_schedule_mock.return_value = self.response(self.event(1))
 
         self.assertEqual(await self.scheduler.discover_events(), 1)
         self.assertEqual(await self.scheduler.discover_events(), 0)
@@ -724,7 +744,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_two_users_get_independent_deliveries(self) -> None:
         await self.add_users((10, "3.2"), (20, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(self.event(1))
+        self.fetch_schedule_mock.return_value = self.response(self.event(1))
 
         await self.scheduler.discover_events()
 
@@ -734,7 +754,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_all_users_receive_the_shared_immutable_group_snapshot(self) -> None:
         await self.add_users((10, "3.2"), (20, "4.1"))
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "0"}, "4.1": {"00:00": "1"}})
         )
 
@@ -750,7 +770,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
     async def test_accepted_discovery_refreshes_existing_cache(self) -> None:
         await self.add_users((10, "3.2"))
         await self.add_cache(times={"00:00": "10"})
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "1"}})
         )
 
@@ -809,12 +829,12 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         )
         for result in EventPersistenceResult:
             self.assertFalse(hasattr(result, "cache_compatible"))
-        with self.assertRaises(ValueError):
-            EventPersistenceResult("created", True)
+        # Exercise the retired two-argument constructor at runtime.
+        self.assertRaises(ValueError, EventPersistenceResult, "created", True)
 
     async def test_discovery_caches_only_the_authoritative_group(self) -> None:
         await self.add_users((10, "3.2"), (20, "4.1"))
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "0"}, "4.1": {"00:00": "1"}})
         )
 
@@ -828,7 +848,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_discovery_schedule_does_not_overwrite_cache(self) -> None:
         await self.add_users((10, "3.2"), (20, "4.1"))
         await self.add_cache(group="4.1", times={"00:00": "0"})
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "1"}, "4.1": {"24:00": "1"}})
         )
 
@@ -843,7 +863,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         await self.add_users((10, "3.2"))
         await self.add_cache(times={"00:00": "10"})
         self.now = datetime.now(UTC)
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "1"}})
         )
         await self.scheduler.discover_events()
@@ -856,7 +876,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
     async def test_notification_and_cache_share_the_accepted_snapshot(self) -> None:
         await self.add_users((10, "3.2"))
         times = {"00:00": "1", "12:30": "10"}
-        self.service.fetch_schedule.return_value = self.response(self.event(1, {"3.2": times}))
+        self.fetch_schedule_mock.return_value = self.response(self.event(1, {"3.2": times}))
 
         await self.scheduler.discover_events()
 
@@ -868,7 +888,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_processed_event_refreshes_cache_without_duplicate_delivery(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "0"}})
         )
         await self.scheduler.discover_events()
@@ -878,7 +898,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             original_delivery.event_date,
             original_delivery.message,
         )
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "1"}})
         )
 
@@ -894,7 +914,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_persistence_failure_does_not_attempt_cache_upsert(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(self.event(1))
+        self.fetch_schedule_mock.return_value = self.response(self.event(1))
 
         async def fail_commit(_session: AsyncSession) -> None:
             raise OperationalError("COMMIT", {}, Exception("simulated"))
@@ -912,7 +932,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_uncertain_commit_does_not_advance_cache(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(self.event(1))
+        self.fetch_schedule_mock.return_value = self.response(self.event(1))
         original_commit = AsyncSession.commit
 
         async def commit_then_fail(session: AsyncSession) -> None:
@@ -932,7 +952,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_event_is_retried_on_later_poll(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(self.event(1))
+        self.fetch_schedule_mock.return_value = self.response(self.event(1))
         original_commit = AsyncSession.commit
         commit_calls = 0
 
@@ -953,7 +973,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_event_does_not_block_independent_event(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "0"}}),
             self.event(2, {"3.2": {"00:00": "1"}}),
         )
@@ -985,7 +1005,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
                     created_at=self.now,
                 )
             )
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "1"}})
         )
 
@@ -999,12 +1019,18 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_authoritative_cache_write_failure_does_not_lose_durable_outbox(self) -> None:
         await self.add_users((10, "3.2"), (20, "4.1"))
-        self.service.fetch_schedule.return_value = self.response(
+        self.fetch_schedule_mock.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "0"}, "4.1": {"00:00": "1"}})
         )
         original_upsert = self.service.upsert_schedule_cache
 
-        async def fail_one_cache(session, date_graph, group, times, updated_at):
+        async def fail_one_cache(
+            session: AsyncSession,
+            date_graph: str,
+            group: str,
+            times: dict[str, str],
+            updated_at: datetime,
+        ) -> None:
             if group == "3.2":
                 raise OperationalError("cache upsert", {}, Exception("simulated"))
             await original_upsert(session, date_graph, group, times, updated_at)
@@ -1017,7 +1043,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.caches(), [])
 
     async def test_valid_event_without_subscribers_is_recorded_once(self) -> None:
-        self.service.fetch_schedule.return_value = self.response(self.event(1))
+        self.fetch_schedule_mock.return_value = self.response(self.event(1))
 
         self.assertEqual(await self.scheduler.discover_events(), 1)
         self.assertEqual(await self.scheduler.discover_events(), 0)
@@ -1032,7 +1058,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             observed_statuses.append((await self.deliveries())[0].status)
             return object()
 
-        self.bot.send_message.side_effect = send
+        self.send_message_mock.side_effect = send
 
         self.assertEqual(await self.scheduler.process_due_deliveries(), 1)
 
@@ -1088,7 +1114,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_retry_persistence_retries_only_transient_database_failures(self) -> None:
         await self.seed_delivery()
-        self.bot.send_message.side_effect = self.telegram_network_error()
+        self.send_message_mock.side_effect = self.telegram_network_error()
         transient = InterfaceError("retry", {}, Exception("connection unavailable"))
 
         with (
@@ -1110,7 +1136,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_terminal_persistence_retries_only_transient_database_failures(self) -> None:
         await self.seed_delivery()
-        self.bot.send_message.side_effect = TelegramForbiddenError(
+        self.send_message_mock.side_effect = TelegramForbiddenError(
             method=SendMessage(chat_id=10, text="test"), message="bot was blocked"
         )
         transient = OperationalError("terminal", {}, Exception("temporarily unavailable"))
@@ -1158,7 +1184,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
                 raise self.telegram_network_error()
             return object()
 
-        self.bot.send_message.side_effect = send
+        self.send_message_mock.side_effect = send
 
         self.assertEqual(await self.scheduler.process_due_deliveries(), 1)
 
@@ -1181,7 +1207,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
                 )
             return object()
 
-        self.bot.send_message.side_effect = send
+        self.send_message_mock.side_effect = send
 
         self.assertEqual(await self.scheduler.process_due_deliveries(), 1)
 
@@ -1193,14 +1219,14 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_transient_failure_retries_only_after_next_attempt_at(self) -> None:
         await self.seed_delivery()
-        self.bot.send_message.side_effect = [
+        self.send_message_mock.side_effect = [
             self.telegram_network_error("temporary"),
             object(),
         ]
 
         await self.scheduler.process_due_deliveries()
         await self.scheduler.process_due_deliveries()
-        self.assertEqual(self.bot.send_message.await_count, 1)
+        self.assertEqual(self.send_message_mock.await_count, 1)
 
         self.now += timedelta(seconds=60)
         self.assertEqual(await self.scheduler.process_due_deliveries(), 1)
@@ -1211,7 +1237,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fifth_transient_attempt_becomes_exhausted(self) -> None:
         await self.seed_delivery(attempt_count=4)
-        self.bot.send_message.side_effect = self.telegram_network_error("still unavailable")
+        self.send_message_mock.side_effect = self.telegram_network_error("still unavailable")
 
         await self.scheduler.process_due_deliveries()
 
@@ -1223,7 +1249,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_last_error_is_bounded_and_redacts_bot_token(self) -> None:
         await self.seed_delivery()
-        self.bot.send_message.side_effect = self.telegram_network_error(
+        self.send_message_mock.side_effect = self.telegram_network_error(
             f"request bot{TOKEN_SHAPED_SECRET} failed upstream {'x' * 1000}"
         )
 
@@ -1267,7 +1293,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unexpected_local_exception_does_not_count_or_schedule_attempt(self) -> None:
         await self.seed_delivery()
-        self.bot.send_message.side_effect = RuntimeError("local serialization bug")
+        self.send_message_mock.side_effect = RuntimeError("local serialization bug")
 
         with self.assertLogs("src.poweron.scheduler", level="ERROR") as logs:
             await self.scheduler.process_due_deliveries()
@@ -1281,7 +1307,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_terminal_telegram_error_marks_terminal_and_removes_user(self) -> None:
         await self.seed_delivery()
-        self.bot.send_message.side_effect = TelegramForbiddenError(
+        self.send_message_mock.side_effect = TelegramForbiddenError(
             method=SendMessage(chat_id=10, text="test"), message="bot was blocked"
         )
 
@@ -1297,7 +1323,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_arbitrary_bad_request_is_recoverable_not_terminal(self) -> None:
         await self.seed_delivery()
-        self.bot.send_message.side_effect = TelegramBadRequest(
+        self.send_message_mock.side_effect = TelegramBadRequest(
             method=SendMessage(chat_id=10, text="test"), message="temporary malformed response"
         )
 
@@ -1321,7 +1347,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Event().wait()
             return object()
 
-        self.bot.send_message.side_effect = send
+        self.send_message_mock.side_effect = send
         task = asyncio.create_task(self.scheduler.process_due_deliveries())
         await started.wait()
         task.cancel()
@@ -1336,20 +1362,20 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         await self.seed_delivery(next_attempt_at=None)
 
         self.assertEqual(await self.scheduler.process_due_deliveries(), 1)
-        self.bot.send_message.assert_awaited_once()
+        self.send_message_mock.assert_awaited_once()
 
     async def test_future_next_attempt_is_not_due(self) -> None:
         await self.seed_delivery(next_attempt_at=self.now + timedelta(minutes=1))
 
         self.assertEqual(await self.scheduler.process_due_deliveries(), 0)
-        self.bot.send_message.assert_not_awaited()
+        self.send_message_mock.assert_not_awaited()
 
     async def test_restart_resumes_pending_delivery(self) -> None:
         await self.add_users((10, "3.2"))
-        self.service.fetch_schedule.return_value = self.response(self.event(1))
+        self.fetch_schedule_mock.return_value = self.response(self.event(1))
         await self.scheduler.discover_events()
 
-        restarted_bot = SimpleNamespace(send_message=AsyncMock(return_value=object()))
+        restarted_bot, restarted_send_message = self.mocked_bot()
         restarted = ScheduleScheduler(
             restarted_bot,
             service=self.service,
@@ -1358,7 +1384,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(await restarted.process_due_deliveries(), 1)
-        restarted_bot.send_message.assert_awaited_once()
+        restarted_send_message.assert_awaited_once()
         self.assertEqual((await self.deliveries())[0].status, DeliveryStatus.SENT.value)
 
     async def test_run_processes_pending_before_discovering_new_events(self) -> None:
@@ -1368,11 +1394,11 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.deliveries())[0].status, DeliveryStatus.SENT.value)
             raise asyncio.CancelledError
 
-        self.service.fetch_schedule.side_effect = fetch
+        self.fetch_schedule_mock.side_effect = fetch
 
         with self.assertRaises(asyncio.CancelledError):
             await self.scheduler.run()
-        self.bot.send_message.assert_awaited_once()
+        self.send_message_mock.assert_awaited_once()
 
     async def test_run_retries_transient_identity_read_before_any_phase(self) -> None:
         delivery = AsyncMock(return_value=0)
@@ -1382,7 +1408,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             delivery.assert_not_awaited()
             discovery.assert_not_awaited()
 
-        self.resolver.ensure_source_identity.side_effect = [
+        self.ensure_source_identity_mock.side_effect = [
             OperationalError("identity read", {}, Exception("simulated")),
             None,
         ]
@@ -1396,7 +1422,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.scheduler.run()
 
-        self.assertEqual(self.resolver.ensure_source_identity.await_count, 2)
+        self.assertEqual(self.ensure_source_identity_mock.await_count, 2)
         self.scheduler.sleep.assert_awaited_once_with(self.scheduler.poll_interval)
         delivery.assert_awaited_once_with()
         discovery.assert_awaited_once_with()
@@ -1405,7 +1431,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_treats_source_identity_mismatch_as_fatal(self) -> None:
         delivery = AsyncMock(return_value=0)
         discovery = AsyncMock(return_value=0)
-        self.resolver.ensure_source_identity.side_effect = SourceIdentityError("city mismatch")
+        self.ensure_source_identity_mock.side_effect = SourceIdentityError("city mismatch")
 
         with (
             patch.object(self.scheduler, "process_due_deliveries", delivery),
@@ -1420,7 +1446,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_retries_interface_identity_failure(self) -> None:
         delivery = AsyncMock(return_value=0)
         discovery = AsyncMock(side_effect=asyncio.CancelledError)
-        self.resolver.ensure_source_identity.side_effect = [
+        self.ensure_source_identity_mock.side_effect = [
             InterfaceError("identity connection", {}, Exception("simulated")),
             None,
         ]
@@ -1434,7 +1460,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.scheduler.run()
 
-        self.assertEqual(self.resolver.ensure_source_identity.await_count, 2)
+        self.assertEqual(self.ensure_source_identity_mock.await_count, 2)
         self.scheduler.sleep.assert_awaited_once_with(self.scheduler.poll_interval)
         delivery.assert_awaited_once_with()
         discovery.assert_awaited_once_with()
@@ -1452,8 +1478,8 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(exception=type(failure).__name__):
                 delivery = AsyncMock(return_value=0)
                 discovery = AsyncMock(return_value=0)
-                self.resolver.ensure_source_identity.reset_mock(side_effect=True)
-                self.resolver.ensure_source_identity.side_effect = failure
+                self.ensure_source_identity_mock.reset_mock(side_effect=True)
+                self.ensure_source_identity_mock.side_effect = failure
 
                 with (
                     patch.object(self.scheduler, "process_due_deliveries", delivery),
@@ -1468,7 +1494,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_propagates_identity_check_cancellation_before_any_phase(self) -> None:
         delivery = AsyncMock(return_value=0)
         discovery = AsyncMock(return_value=0)
-        self.resolver.ensure_source_identity.side_effect = asyncio.CancelledError
+        self.ensure_source_identity_mock.side_effect = asyncio.CancelledError
 
         with (
             patch.object(self.scheduler, "process_due_deliveries", delivery),
@@ -1482,14 +1508,14 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_group_unavailability_still_processes_existing_pending_delivery(self) -> None:
         await self.seed_delivery()
-        self.resolver.ensure_group.return_value = None
+        self.ensure_group_mock.return_value = None
         self.scheduler.sleep = AsyncMock(side_effect=asyncio.CancelledError)
 
         with self.assertRaises(asyncio.CancelledError):
             await self.scheduler.run()
 
-        self.bot.send_message.assert_awaited_once()
-        self.service.fetch_schedule.assert_not_awaited()
+        self.send_message_mock.assert_awaited_once()
+        self.fetch_schedule_mock.assert_not_awaited()
         self.assertEqual((await self.deliveries())[0].status, DeliveryStatus.SENT.value)
 
     async def test_transient_startup_refresh_waits_before_retry_and_preserves_delivery(
@@ -1499,7 +1525,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         wait_started = asyncio.Event()
         release_wait = asyncio.Event()
         discovery = AsyncMock(side_effect=asyncio.CancelledError)
-        self.resolver.ensure_group.side_effect = [
+        self.ensure_group_mock.side_effect = [
             OperationalError("group state", {}, Exception("simulated")),
             "3.2",
         ]
@@ -1516,20 +1542,20 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         ):
             task = asyncio.create_task(self.scheduler.run())
             await wait_started.wait()
-            self.assertEqual(self.resolver.ensure_group.await_count, 1)
+            self.assertEqual(self.ensure_group_mock.await_count, 1)
             self.assertEqual((await self.deliveries())[0].status, DeliveryStatus.SENT.value)
             discovery.assert_not_awaited()
             release_wait.set()
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
-        self.assertEqual(self.resolver.ensure_group.await_count, 2)
+        self.assertEqual(self.ensure_group_mock.await_count, 2)
         discovery.assert_awaited_once_with()
         self.assertIn("Startup group refresh failed", "\n".join(logs.output))
 
     async def test_cancellation_during_startup_retry_wait_propagates(self) -> None:
         wait_started = asyncio.Event()
-        self.resolver.ensure_group.side_effect = OperationalError(
+        self.ensure_group_mock.side_effect = OperationalError(
             "group state", {}, Exception("simulated")
         )
 
@@ -1545,7 +1571,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await asyncio.wait_for(task, timeout=0.2)
 
-        self.assertEqual(self.resolver.ensure_group.await_count, 1)
+        self.assertEqual(self.ensure_group_mock.await_count, 1)
 
     async def test_fatal_startup_phase_failures_escape_before_later_phases(self) -> None:
         failures = (
@@ -1561,8 +1587,8 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(exception=type(failure).__name__):
                 delivery = AsyncMock(return_value=0)
                 discovery = AsyncMock(return_value=0)
-                self.resolver.ensure_group.reset_mock(side_effect=True)
-                self.resolver.ensure_group.side_effect = failure
+                self.ensure_group_mock.reset_mock(side_effect=True)
+                self.ensure_group_mock.side_effect = failure
 
                 with (
                     patch.object(self.scheduler, "process_due_deliveries", delivery),
@@ -1657,7 +1683,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         await self.seed_delivery(status=DeliveryStatus.SENT.value)
 
         self.assertEqual(await self.scheduler.process_due_deliveries(), 0)
-        self.bot.send_message.assert_not_awaited()
+        self.send_message_mock.assert_not_awaited()
 
     async def test_crash_after_telegram_success_before_commit_can_duplicate(self) -> None:
         """Document the unavoidable accepted-by-Telegram/pre-commit duplicate window."""
@@ -1674,7 +1700,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             await self.scheduler.process_due_deliveries()
 
         self.assertEqual((await self.deliveries())[0].status, DeliveryStatus.PENDING.value)
-        restarted_bot = SimpleNamespace(send_message=AsyncMock(return_value=object()))
+        restarted_bot, restarted_send_message = self.mocked_bot()
         restarted = ScheduleScheduler(
             restarted_bot,
             service=self.service,
@@ -1682,22 +1708,23 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             clock=lambda: self.now,
         )
         await restarted.process_due_deliveries()
-        self.assertEqual(self.bot.send_message.await_count, 1)
-        self.assertEqual(restarted_bot.send_message.await_count, 1)
+        self.assertEqual(self.send_message_mock.await_count, 1)
+        self.assertEqual(restarted_send_message.await_count, 1)
 
     async def test_no_database_transaction_is_open_during_telegram_io(self) -> None:
         await self.seed_delivery()
-        opened_sessions = []
+        opened_sessions: list[AsyncSession] = []
+        original_call = async_sessionmaker.__call__
 
-        def tracked_session():
-            session = self.session()
+        def tracked_session(factory: async_sessionmaker[AsyncSession]) -> AsyncSession:
+            session = original_call(factory)
             opened_sessions.append(session)
             return session
 
         scheduler = ScheduleScheduler(
             self.bot,
             service=self.service,
-            session_factory=tracked_session,  # type: ignore[arg-type]
+            session_factory=self.session,
             clock=lambda: self.now,
         )
 
@@ -1706,9 +1733,10 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(not session.in_transaction() for session in opened_sessions))
             return object()
 
-        self.bot.send_message.side_effect = send
+        self.send_message_mock.side_effect = send
 
-        await scheduler.process_due_deliveries()
+        with patch.object(async_sessionmaker, "__call__", tracked_session):
+            await scheduler.process_due_deliveries()
 
     async def test_overlapping_delivery_loops_do_not_deliberately_send_twice(self) -> None:
         await self.seed_delivery()
@@ -1719,10 +1747,10 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             return object()
 
-        self.bot.send_message.side_effect = send
+        self.send_message_mock.side_effect = send
         first = asyncio.create_task(self.scheduler.process_due_deliveries())
         await release.wait()
         second = asyncio.create_task(self.scheduler.process_due_deliveries())
         await asyncio.gather(first, second)
 
-        self.assertEqual(self.bot.send_message.await_count, 1)
+        self.assertEqual(self.send_message_mock.await_count, 1)
