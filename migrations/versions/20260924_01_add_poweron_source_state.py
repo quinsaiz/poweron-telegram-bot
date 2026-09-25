@@ -1,4 +1,4 @@
-"""Add durable PowerOn source and shared-group state.
+"""Add durable poweron source and shared-group state.
 
 Revision ID: poweron_source_state
 Revises: f412bdd7c3e0

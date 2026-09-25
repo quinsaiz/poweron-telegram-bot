@@ -150,7 +150,7 @@ class PowerOnGroupResolver:
         async with source_state_write_transaction(self.session_factory) as session:
             state = await session.get(PowerOnSourceState, SOURCE_STATE_ID)
             if state is None:
-                raise RuntimeError("PowerOn source state disappeared during group refresh")
+                raise RuntimeError("poweron source state disappeared during group refresh")
             if state.city_id != settings.POWERON_CITY_ID:
                 raise self._city_mismatch_error(state.city_id)
             state.last_refresh_attempt_at = attempted_at
@@ -160,7 +160,7 @@ class PowerOnGroupResolver:
         async with source_state_write_transaction(self.session_factory) as session:
             state = await session.get(PowerOnSourceState, SOURCE_STATE_ID)
             if state is None:
-                raise RuntimeError("PowerOn source state disappeared during group refresh")
+                raise RuntimeError("poweron source state disappeared during group refresh")
             if state.city_id != settings.POWERON_CITY_ID:
                 raise self._city_mismatch_error(state.city_id)
             old_group = state.group
@@ -169,7 +169,7 @@ class PowerOnGroupResolver:
             state.last_successful_refresh_at = refreshed_at
 
         if old_group is not None and old_group != group:
-            logger.info("PowerOn group changed from %s to %s", old_group, group)
+            logger.info("poweron group changed from %s to %s", old_group, group)
         return group
 
     async def ensure_group(self) -> str | None:
@@ -185,7 +185,7 @@ class PowerOnGroupResolver:
                 raise
             except (GroupDiscoveryError, ValidationError, ValueError, httpx.HTTPError) as error:
                 await self._record_failure(attempted_at)
-                logger.warning("PowerOn group refresh failed: %s", type(error).__name__)
+                logger.warning("poweron group refresh failed: %s", type(error).__name__)
                 return snapshot.group
 
             return await self._record_success(group, attempted_at)

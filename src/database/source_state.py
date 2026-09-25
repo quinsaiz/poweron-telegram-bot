@@ -1,4 +1,4 @@
-"""Atomic SQLite transactions for the singleton PowerOn source identity."""
+"""Atomic SQLite transactions for the singleton poweron source identity."""
 
 from __future__ import annotations
 

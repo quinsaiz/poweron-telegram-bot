@@ -222,7 +222,7 @@ class PowerService:
     @staticmethod
     def parse_event_date(date_graph: str | None) -> calendar_date | None:
         parsed = parse_date_graph(date_graph)
-        # PowerOn identifies a schedule by the calendar date written on the wire.
+        # poweron identifies a schedule by the calendar date written on the wire.
         # The offset is still mandatory and validated, but converting the instant can
         # incorrectly move historical payloads to an adjacent Kyiv calendar day.
         return parsed.date() if parsed is not None else None
@@ -336,7 +336,7 @@ class PowerService:
             response = await client.get(self.schedule_url, params=params)
 
         if response.status_code != 200:
-            logger.error("PowerOn schedule request failed with status %s", response.status_code)
+            logger.error("poweron schedule request failed with status %s", response.status_code)
             return ScheduleFetchResult(None, relevant_dates)
 
         schedule = ScheduleResponse.model_validate(response.json())

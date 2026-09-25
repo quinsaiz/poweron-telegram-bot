@@ -156,7 +156,7 @@ class ScheduleScheduler:
             city_id = settings.POWERON_CITY_ID
             group = await self.service.group_resolver.ensure_group()
             if group is None:
-                logger.warning("Skipping schedule discovery: PowerOn group is unavailable")
+                logger.warning("Skipping schedule discovery: poweron group is unavailable")
                 return 0
             try:
                 fetch = await self.service.fetch_schedule(group)
@@ -164,7 +164,7 @@ class ScheduleScheduler:
                 raise
             except (httpx.HTTPError, json.JSONDecodeError, ValidationError) as error:
                 logger.warning(
-                    "PowerOn schedule discovery is unavailable: %s",
+                    "poweron schedule discovery is unavailable: %s",
                     type(error).__name__,
                 )
                 return 0
@@ -580,7 +580,7 @@ class ScheduleScheduler:
         except SourceIdentityError:
             raise
         except TRANSIENT_DATABASE_EXCEPTIONS:
-            logger.exception("PowerOn source identity check failed; scheduler will retry")
+            logger.exception("poweron source identity check failed; scheduler will retry")
             return False
         return True
 

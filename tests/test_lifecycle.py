@@ -175,7 +175,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await discovery_resumed.wait()
                 self.assertEqual(self.ensure_group.await_count, 2)
 
-        self.assertIn("Initial PowerOn group refresh failed", "\n".join(logs.output))
+        self.assertIn("Initial poweron group refresh failed", "\n".join(logs.output))
         self.assertTrue(self.dispatcher.polling_finished.is_set())
         self.assertTrue(self.monitor_finished.is_set())
         self.session.close.assert_awaited_once_with()

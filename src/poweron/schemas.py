@@ -13,7 +13,7 @@ from pydantic import (
     model_validator,
 )
 
-# PowerOn emits an RFC-3339-style timestamp with whole seconds and either
+# poweron emits an RFC-3339-style timestamp with whole seconds and either
 # uppercase Z or a mandatory numeric offset.
 DATE_GRAPH_PATTERN = re.compile(
     r"[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"

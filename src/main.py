@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 from collections.abc import AsyncIterator  # noqa: TC003  # runtime lifespan reflection
 from contextlib import asynccontextmanager
@@ -339,7 +341,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         except asyncio.CancelledError:
             raise
         except TRANSIENT_DATABASE_EXCEPTIONS:
-            logger.exception("Initial PowerOn group refresh failed; scheduler will retry")
+            logger.exception("Initial poweron group refresh failed; scheduler will retry")
             startup_group_refresh_state = StartupGroupRefreshState.TRANSIENT_FAILURE
         polling_task = asyncio.create_task(
             dp.start_polling(
