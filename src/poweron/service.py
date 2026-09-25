@@ -38,8 +38,6 @@ GROUP_UNAVAILABLE_MESSAGE = "⚠️ **Інформація про групу т�
 
 @dataclass(frozen=True)
 class ScheduleFetchResult:
-    """A validated raw response and the local dates its request may satisfy."""
-
     response: ScheduleResponse | None
     relevant_dates: frozenset[calendar_date]
 
@@ -95,9 +93,6 @@ class PowerService:
         local_today = now_kyiv.date()
         relevant_dates = frozenset((local_today, local_today + timedelta(days=1)))
 
-        # The live endpoint currently returned events equal to both after and before.
-        # Surrounding Kyiv midnights and exact relevant-date filtering keep correctness
-        # independent of undocumented boundary behavior.
         after_local = datetime.combine(local_today - timedelta(days=1), time.min, tzinfo=KYIV_TZ)
         before_local = datetime.combine(local_today + timedelta(days=2), time.min, tzinfo=KYIV_TZ)
         return DiscoveryFetchWindow(
@@ -108,7 +103,9 @@ class PowerService:
 
     @staticmethod
     async def get_schedule_from_cache(
-        date_str: str, group: str, allow_stale: bool = False
+        date_str: str,
+        group: str,
+        allow_stale: bool = False,
     ) -> tuple[dict[str, str] | None, datetime | None]:
         async with async_session() as session:
             result = await session.execute(
@@ -169,7 +166,10 @@ class PowerService:
 
     @classmethod
     async def save_schedule_to_cache(
-        cls, date_str: str, group: str, times_dict: dict[str, str]
+        cls,
+        date_str: str,
+        group: str,
+        times_dict: dict[str, str],
     ) -> None:
         async with async_session() as session:
             try:
@@ -329,9 +329,10 @@ class PowerService:
             ("time", settings.POWERON_CITY_ID),
         ]
 
-        # logger.info("Requesting service schedule for date range and group...")
         async with httpx.AsyncClient(
-            headers=self.headers, follow_redirects=True, timeout=30.0
+            headers=self.headers,
+            follow_redirects=True,
+            timeout=30.0,
         ) as client:
             response = await client.get(self.schedule_url, params=params)
 
@@ -343,7 +344,9 @@ class PowerService:
         return ScheduleFetchResult(schedule, relevant_dates)
 
     async def refresh_schedule(
-        self, group: str, date: datetime | None = None
+        self,
+        group: str,
+        date: datetime | None = None,
     ) -> CacheRefreshResult:
         city_id = settings.POWERON_CITY_ID
         fetch = await self.fetch_schedule(group, date)
@@ -384,7 +387,9 @@ class PowerService:
         return CacheRefreshResult(fetch, usable_events, tuple(cached_dates))
 
     async def get_schedule(
-        self, group: str, date: datetime | None = None
+        self,
+        group: str,
+        date: datetime | None = None,
     ) -> ScheduleResponse | None:
         refresh = await self.refresh_schedule(group, date)
         if not refresh.has_usable_event:

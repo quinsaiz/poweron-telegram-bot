@@ -212,7 +212,10 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             state.group = group
 
     async def add_cache(
-        self, date_str: str | None = None, group: str = "3.2", age_minutes: int = 31
+        self,
+        date_str: str | None = None,
+        group: str = "3.2",
+        age_minutes: int = 31,
     ) -> None:
         async with self.session() as session:
             session.add(
@@ -265,7 +268,10 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(client_patch.stop)
 
     def isolated_api(
-        self, *, times: dict[str, str], group: str
+        self,
+        *,
+        times: dict[str, str],
+        group: str,
     ) -> AbstractContextManager[MagicMock]:
         real_client = httpx.AsyncClient
         payload = {
@@ -332,7 +338,8 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         release_fetch = asyncio.Event()
 
         async def fetch(
-            _group: str, _date: datetime | None = None
+            _group: str,
+            _date: datetime | None = None,
         ) -> service_module.ScheduleFetchResult:
             fetch_started.set()
             await release_fetch.wait()
@@ -419,7 +426,9 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
             await original_rollback(session)
 
         async def check_lookup(
-            date_graph: str, group: str, allow_stale: bool = False
+            date_graph: str,
+            group: str,
+            allow_stale: bool = False,
         ) -> tuple[dict[str, str] | None, datetime | None]:
             if failed_commit:
                 self.assertTrue(rollbacks)
@@ -566,7 +575,9 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.mock_api(times={"24:00": "1"})
 
         with patch.object(
-            self.service, "save_authoritative_schedule_to_cache", new_callable=AsyncMock
+            self.service,
+            "save_authoritative_schedule_to_cache",
+            new_callable=AsyncMock,
         ) as save_cache:
             text, ok = await self.service.get_formatted_schedule(self.chat_id, self.date)
 

@@ -36,10 +36,12 @@ class PowerOnSourceState(Base):
     city_id: Mapped[int] = mapped_column(Integer)
     group: Mapped[str | None] = mapped_column(String(32), nullable=True)
     last_refresh_attempt_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
+        DateTime(timezone=True),
+        nullable=True,
     )
     last_successful_refresh_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
+        DateTime(timezone=True),
+        nullable=True,
     )
 
 

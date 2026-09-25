@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator  # noqa: TC003  # runtime lifespan reflection
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -22,7 +21,7 @@ from src.telegram.handlers import router as telegram_router
 from src.telegram.middlewares import AntiFloodMiddleware
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
+    from collections.abc import AsyncIterator, Coroutine
 
 logger = setup_logger(__name__, settings.LOG_LEVEL)
 
@@ -210,14 +209,19 @@ async def _wait_for_task(
 
 
 async def _close_resource(
-    coro: Coroutine[Any, Any, Any], name: str, errors: list[Exception]
+    coro: Coroutine[Any, Any, Any],
+    name: str,
+    errors: list[Exception],
 ) -> None:
     task = asyncio.create_task(coro)
     await _wait_for_task(task, name, errors, wait_seconds=RESOURCE_CLOSE_TIMEOUT)
 
 
 def _stop_request_result(
-    stop_task: asyncio.Task[Any], errors: list[Exception], *, cancelled: bool
+    stop_task: asyncio.Task[Any],
+    errors: list[Exception],
+    *,
+    cancelled: bool,
 ) -> None:
     try:
         stop_task.result()
@@ -227,7 +231,6 @@ def _stop_request_result(
             logger.error("%s", error)
             errors.append(error)
     except RuntimeError as error:
-        # Startup can finish before the polling task acquires aiogram's lock.
         if str(error) != "Polling is not started":
             logger.error("Polling stop request failed", exc_info=error)
             errors.append(error)

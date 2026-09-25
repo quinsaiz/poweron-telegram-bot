@@ -17,6 +17,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "mypy>=2.3.1",
+    "pytest>=9.1.1",
     "ruff>=0.16.8",
 ]
 
@@ -24,6 +25,9 @@ dev = [
 target-version = "py314"
 line-length = 100
 src = ["src"]
+
+[tool.ruff.format]
+skip-magic-trailing-comma = false
 
 [tool.ruff.lint]
 select = [
@@ -55,3 +59,6 @@ files = [
 ]
 warn_unused_configs = true
 show_error_codes = true
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

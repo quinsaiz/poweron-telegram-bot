@@ -35,8 +35,8 @@ from sqlalchemy.orm.exc import StaleDataError
 from src.config import settings
 from src.database.engine import async_session
 from src.database.errors import TRANSIENT_DATABASE_EXCEPTIONS
-from src.database.models import NotificationDelivery, ProcessedScheduleEvent, User
-from src.database.source_state import source_authority_transaction
+from src.database.models import NotificationDelivery, ProcessedScheduleEvent, ScheduleCache, User
+from src.database.source_state import source_authority_transaction, source_state_write_transaction
 from src.domain_time import utc_now
 from src.logger import setup_logger
 from src.poweron.groups import SourceIdentityError
@@ -140,6 +140,7 @@ class ScheduleScheduler:
         self.sleep = sleep
         self._discovery_lock = asyncio.Lock()
         self._delivery_lock = asyncio.Lock()
+        self._last_known_group: str | None = None
 
     def _clock_now(self) -> datetime:
         value = self.clock()
@@ -151,13 +152,77 @@ class ScheduleScheduler:
         async with self.session_factory() as session:
             return list((await session.execute(select(User))).scalars().all())
 
+    async def _clear_stale_group_data(self, old_group: str, city_id: int) -> None:
+        try:
+            async with source_state_write_transaction(self.session_factory) as session:
+                await session.execute(
+                    delete(NotificationDelivery).where(
+                        NotificationDelivery.recipient_group == old_group,
+                        NotificationDelivery.status == DeliveryStatus.PENDING.value,
+                    )
+                )
+                await session.execute(delete(ScheduleCache).where(ScheduleCache.group == old_group))
+            logger.info("Cleared stale group data for old group=%s city_id=%s", old_group, city_id)
+        except EXPECTED_PERSISTENCE_EXCEPTIONS:
+            logger.exception("Could not clear stale group data for old group=%s", old_group)
+
+    async def _notify_group_change(self, old_group: str, new_group: str) -> None:
+        users = await self._load_users()
+        if not users:
+            return
+        message = (
+            f"⚠️ **Увага! Ваша група змінилась**\n\n"
+            f"🏘 Стара група: **{old_group}**\n"
+            f"🏘 Нова група: **{new_group}**\n\n"
+            f"📬 Сповіщення про графіки тепер надходитимуть для групи **{new_group}**."
+        )
+        for user in users:
+            try:
+                await self.bot.send_message(user.chat_id, message, parse_mode="Markdown")
+            except asyncio.CancelledError:
+                raise
+            except TelegramForbiddenError, TelegramNotFound:
+                try:
+                    async with self.session_factory() as session, session.begin():
+                        await session.execute(delete(User).where(User.chat_id == user.chat_id))
+                except Exception:
+                    logger.exception("Could not remove blocked user chat_id=%s", user.chat_id)
+            except Exception:
+                logger.exception(
+                    "Could not send group-change notification to chat_id=%s", user.chat_id
+                )
+
     async def discover_events(self) -> int:
         async with self._discovery_lock:
             city_id = settings.POWERON_CITY_ID
-            group = await self.service.group_resolver.ensure_group()
-            if group is None:
+            refresh = await self.service.group_resolver.ensure_group()
+            if refresh is None:
                 logger.warning("Skipping schedule discovery: poweron group is unavailable")
                 return 0
+            group = str(refresh)
+            old_group = None
+            if getattr(refresh, "group_changed", False):
+                old_group = getattr(refresh, "previous_group", None)
+            if old_group is None and hasattr(self.service.group_resolver, "consume_group_change"):
+                pending = self.service.group_resolver.consume_group_change()
+                if pending is not None:
+                    old_group = pending[0]
+            if (
+                old_group is None
+                and self._last_known_group is not None
+                and self._last_known_group != group
+            ):
+                old_group = self._last_known_group
+            self._last_known_group = group
+
+            if old_group is not None:
+                logger.info(
+                    "Group changed from %s to %s — clearing stale data and notifying users",
+                    old_group,
+                    group,
+                )
+                await self._clear_stale_group_data(old_group, city_id)
+                await self._notify_group_change(old_group, group)
             try:
                 fetch = await self.service.fetch_schedule(group)
             except asyncio.CancelledError:
@@ -306,6 +371,26 @@ class ScheduleScheduler:
                             usable.event_id,
                         )
                         return EventPersistenceResult.EXISTING_INCOMPATIBLE
+                    matching_delivery = await session.execute(
+                        select(NotificationDelivery.id)
+                        .where(
+                            NotificationDelivery.event_id == usable.event_id,
+                            NotificationDelivery.recipient_group == recipient_group,
+                        )
+                        .limit(1)
+                    )
+                    if matching_delivery.scalar_one_or_none() is not None:
+                        return EventPersistenceResult.EXISTING_COMPATIBLE
+
+                    if users:
+                        await session.execute(
+                            delete(NotificationDelivery).where(
+                                NotificationDelivery.event_id == usable.event_id
+                            )
+                        )
+                        session.add_all(deliveries)
+                        return EventPersistenceResult.CREATED
+
                     return EventPersistenceResult.EXISTING_COMPATIBLE
                 session.add(
                     ProcessedScheduleEvent(
@@ -314,8 +399,6 @@ class ScheduleScheduler:
                         created_at=discovered_at,
                     )
                 )
-                # No ORM relationship is needed, so explicitly flush the FK parent
-                # before its children while retaining one atomic transaction.
                 await session.flush()
                 session.add_all(deliveries)
             return EventPersistenceResult.CREATED
@@ -371,7 +454,10 @@ class ScheduleScheduler:
                 )
 
     async def _persist_usable_events(
-        self, fetch: ScheduleFetchResult, city_id: int, group: str
+        self,
+        fetch: ScheduleFetchResult,
+        city_id: int,
+        group: str,
     ) -> int:
         if fetch.response is None or not fetch.response.events:
             logger.info("The schedule is empty or unavailable.")
@@ -498,7 +584,10 @@ class ScheduleScheduler:
             )
 
     async def _record_terminal_failure(
-        self, attempt: DeliveryAttempt, error: BaseException, completed_at: datetime
+        self,
+        attempt: DeliveryAttempt,
+        error: BaseException,
+        completed_at: datetime,
     ) -> None:
         completed_at = _as_utc(completed_at)
         async with self.session_factory() as session, session.begin():
@@ -546,8 +635,6 @@ class ScheduleScheduler:
         return False
 
     async def process_due_deliveries(self) -> int:
-        """Attempt each currently due row once without a DB transaction during Telegram I/O."""
-
         async with self._delivery_lock:
             delivery_ids = await self._due_delivery_ids(self._clock_now())
             sent = 0

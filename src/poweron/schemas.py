@@ -50,7 +50,10 @@ class BuildingGroup(BaseModel):
 
 class BuildingGroupsResponse(BaseModel):
     building_groups: list[BuildingGroup] = Field(
-        ..., alias="buildingGroups", min_length=0, max_length=100
+        ...,
+        alias="buildingGroups",
+        min_length=0,
+        max_length=100,
     )
 
     def normalized_groups(self) -> tuple[str, ...]:
@@ -62,8 +65,6 @@ class BuildingGroupsResponse(BaseModel):
 
 
 class ScheduleMember(BaseModel):
-    # Members are intentionally tolerant here so one incomplete upstream member does
-    # not hide other usable members. Usability is decided per event and group.
     id: StrictInt | StrictStr | None = None
     date_graph: str | None = Field(default=None, alias="dateGraph", strict=True)
     data_json: Any = Field(default_factory=dict, alias="dataJson")
@@ -85,8 +86,6 @@ class ScheduleResponse(BaseModel):
             try:
                 members.append(ScheduleMember.model_validate(raw_member))
             except ValidationError:
-                # Retain an unusable placeholder so one malformed member cannot make
-                # valid siblings disappear with a response-wide validation failure.
                 members.append(ScheduleMember())
         return members
 

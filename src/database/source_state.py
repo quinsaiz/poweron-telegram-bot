@@ -1,5 +1,3 @@
-"""Atomic SQLite transactions for the singleton poweron source identity."""
-
 from __future__ import annotations
 
 import asyncio
@@ -22,8 +20,6 @@ _source_write_lock = asyncio.Lock()
 async def source_state_write_transaction(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> AsyncIterator[AsyncSession]:
-    """Serialize source-state writers and acquire SQLite's write lock before reading."""
-
     async with _source_write_lock, session_factory() as session:
         await session.execute(text("BEGIN IMMEDIATE"))
         try:
@@ -41,8 +37,6 @@ async def source_authority_transaction(
     city_id: int,
     group: str,
 ) -> AsyncIterator[AsyncSession | None]:
-    """Yield a write transaction only while the expected source remains authoritative."""
-
     async with source_state_write_transaction(session_factory) as session:
         state = await session.get(PowerOnSourceState, 1)
         if state is None or state.city_id != city_id or state.group != group:

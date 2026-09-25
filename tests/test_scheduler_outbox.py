@@ -65,7 +65,7 @@ with patch.dict(
         ScheduleCache,
         User,
     )
-    from src.poweron.groups import PowerOnGroupResolver, SourceIdentityError
+    from src.poweron.groups import GroupRefreshResult, PowerOnGroupResolver, SourceIdentityError
     from src.poweron.scheduler import (
         DeliveryStatus,
         EventPersistenceResult,
@@ -114,7 +114,9 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.engine.dispose)
         self.bot, self.send_message_mock = self.mocked_bot()
         self.resolver = PowerOnGroupResolver(session_factory=self.session)
-        self.ensure_group_mock = AsyncMock(return_value="3.2")
+        self.ensure_group_mock = AsyncMock(
+            return_value=GroupRefreshResult(group="3.2", previous_group="3.2")
+        )
         group_patch = patch.object(self.resolver, "ensure_group", self.ensure_group_mock)
         group_patch.start()
         self.addCleanup(group_patch.stop)
@@ -173,7 +175,10 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(fetch.response)
         assert fetch.response is not None
         prepared = self.scheduler._prepare_event(
-            fetch.response.events[0], "3.2", fetch.relevant_dates, self.now
+            fetch.response.events[0],
+            "3.2",
+            fetch.relevant_dates,
+            self.now,
         )
         self.assertIsNotNone(prepared)
         assert prepared is not None
@@ -181,7 +186,10 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
     async def add_users(self, *users: tuple[int, str]) -> None:
         if users:
-            self.ensure_group_mock.return_value = users[0][1]
+            self.ensure_group_mock.return_value = GroupRefreshResult(
+                group=users[0][1],
+                previous_group=users[0][1],
+            )
         async with self.session() as session, session.begin():
             if users:
                 state = await session.get(PowerOnSourceState, 1)
@@ -431,12 +439,15 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.fetch_schedule_mock.side_effect = fetch
         discovery = asyncio.create_task(self.scheduler.discover_events())
         await fetch_started.wait()
-        self.assertEqual(await self.real_resolver_returning("4.1").ensure_group(), "4.1")
+        res = await self.real_resolver_returning("4.1").ensure_group()
+        assert res is not None
+        self.assertEqual(res.group, "4.1")
         release_fetch.set()
 
         self.assertEqual(await discovery, 0)
         self.assertEqual(
-            [event.event_id for event in await self.events()], ["pending-before-change"]
+            [event.event_id for event in await self.events()],
+            ["pending-before-change"],
         )
         self.assertEqual(await self.caches(), [])
         before = (await self.deliveries())[0]
@@ -449,7 +460,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delivered.recipient_group, "3.2")
         self.assertEqual(delivered.message, "message-10")
 
-        self.ensure_group_mock.return_value = "4.1"
+        self.ensure_group_mock.return_value = GroupRefreshResult(group="4.1", previous_group="4.1")
         self.fetch_schedule_mock.side_effect = None
         self.fetch_schedule_mock.return_value = self.response(
             self.event("current-b", {"4.1": {"00:00": "1"}})
@@ -470,9 +481,11 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         await self.add_users((10, "3.2"))
         users = await self.scheduler._load_users()
         prepared = self.prepared_event("stale-event")
-        self.assertEqual(await self.real_resolver_returning("4.1").ensure_group(), "4.1")
+        result = await self.real_resolver_returning("4.1").ensure_group()
+        assert result is not None
+        self.assertEqual(result.group, "4.1")
 
-        result = await self.scheduler._persist_event(
+        res = await self.scheduler._persist_event(
             prepared,
             users,
             self.now,
@@ -480,14 +493,15 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             "3.2",
         )
 
-        self.assertIs(result, EventPersistenceResult.STALE_AUTHORITY)
+        self.assertIs(res, EventPersistenceResult.STALE_AUTHORITY)
         self.assertEqual(await self.events(), [])
         self.assertEqual(await self.deliveries(), [])
 
     async def test_cache_write_rejects_lost_group_authority(self) -> None:
         prepared = self.prepared_event("stale-cache")
-        self.assertEqual(await self.real_resolver_returning("4.1").ensure_group(), "4.1")
-
+        result = await self.real_resolver_returning("4.1").ensure_group()
+        assert result is not None
+        self.assertEqual(result.group, "4.1")
         await self.scheduler._refresh_cache([prepared], self.now, 21005, "3.2")
 
         self.assertEqual(await self.caches(), [])
@@ -524,7 +538,6 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             *args: object,
             **kwargs: object,
         ) -> object:
-            # SQLAlchemy's overloaded generic get cannot type a runtime passthrough wrapper.
             result = await original_get(session, entity, ident, *args, **kwargs)  # type: ignore[arg-type, func-returns-value]
             if asyncio.current_task() is a_task and entity is PowerOnSourceState:
                 authority_read.set()
@@ -561,7 +574,9 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
                 release_authoritative_write.set()
 
             a_result = await asyncio.wait_for(a_task, timeout=2.0)
-            self.assertEqual(await asyncio.wait_for(b_task, timeout=2.0), "4.1")
+            b_result = await asyncio.wait_for(b_task, timeout=2.0)
+            assert b_result is not None
+            self.assertEqual(b_result.group, "4.1")
             self.assertEqual(commit_order, ["A", "B"])
 
         async with self.session() as session:
@@ -1308,7 +1323,8 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
     async def test_terminal_telegram_error_marks_terminal_and_removes_user(self) -> None:
         await self.seed_delivery()
         self.send_message_mock.side_effect = TelegramForbiddenError(
-            method=SendMessage(chat_id=10, text="test"), message="bot was blocked"
+            method=SendMessage(chat_id=10, text="test"),
+            message="bot was blocked",
         )
 
         await self.scheduler.process_due_deliveries()
@@ -1324,7 +1340,8 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
     async def test_arbitrary_bad_request_is_recoverable_not_terminal(self) -> None:
         await self.seed_delivery()
         self.send_message_mock.side_effect = TelegramBadRequest(
-            method=SendMessage(chat_id=10, text="test"), message="temporary malformed response"
+            method=SendMessage(chat_id=10, text="test"),
+            message="temporary malformed response",
         )
 
         await self.scheduler.process_due_deliveries()
@@ -1527,7 +1544,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         discovery = AsyncMock(side_effect=asyncio.CancelledError)
         self.ensure_group_mock.side_effect = [
             OperationalError("group state", {}, Exception("simulated")),
-            "3.2",
+            GroupRefreshResult(group="3.2", previous_group="3.2"),
         ]
 
         async def controlled_wait(delay: float) -> None:
@@ -1754,3 +1771,66 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(first, second)
 
         self.assertEqual(self.send_message_mock.await_count, 1)
+
+    async def test_group_change_clears_stale_data_notifies_users_and_persists_new_schedule(
+        self,
+    ) -> None:
+        await self.add_users((10, "3.2"), (20, "3.2"))
+        self.fetch_schedule_mock.return_value = self.response(
+            self.event(1, {"3.2": {"00:00": "0"}})
+        )
+        self.assertEqual(await self.scheduler.discover_events(), 1)
+        self.assertEqual(len(await self.deliveries()), 2)
+        self.assertEqual({d.recipient_group for d in await self.deliveries()}, {"3.2"})
+        self.assertEqual({c.group for c in await self.caches()}, {"3.2"})
+
+        await self.set_authoritative_group("4.1")
+        self.ensure_group_mock.return_value = GroupRefreshResult(group="4.1", previous_group="3.2")
+        self.fetch_schedule_mock.return_value = self.response(
+            self.event(1, {"4.1": {"00:00": "1"}})
+        )
+
+        persisted = await self.scheduler.discover_events()
+        self.assertEqual(persisted, 1)
+
+        self.assertEqual(self.send_message_mock.await_count, 2)
+        sent_texts = [call.args[1] for call in self.send_message_mock.await_args_list]
+        for text in sent_texts:
+            self.assertIn("Ваша група змінилась", text)
+            self.assertIn("3.2", text)
+            self.assertIn("4.1", text)
+
+        deliveries = await self.deliveries()
+        self.assertEqual(len(deliveries), 2)
+        self.assertEqual({d.recipient_group for d in deliveries}, {"4.1"})
+        self.assertEqual({d.chat_id for d in deliveries}, {10, 20})
+
+        caches = await self.caches()
+        self.assertEqual(len(caches), 1)
+        self.assertEqual(caches[0].group, "4.1")
+        self.assertEqual(json.loads(caches[0].times_json), {"00:00": "1"})
+
+    async def test_group_change_detected_via_database_stale_deliveries(self) -> None:
+        await self.add_users((10, "3.2"))
+        self.fetch_schedule_mock.return_value = self.response(
+            self.event(1, {"3.2": {"00:00": "0"}})
+        )
+        self.assertEqual(await self.scheduler.discover_events(), 1)
+        self.assertEqual(len(await self.deliveries()), 1)
+
+        await self.set_authoritative_group("4.1")
+        self.ensure_group_mock.return_value = GroupRefreshResult(group="4.1", previous_group="3.2")
+        self.fetch_schedule_mock.return_value = self.response(
+            self.event(1, {"4.1": {"00:00": "1"}})
+        )
+
+        persisted = await self.scheduler.discover_events()
+        self.assertEqual(persisted, 1)
+
+        self.assertEqual(self.send_message_mock.await_count, 1)
+        assert self.send_message_mock.await_args is not None
+        self.assertIn("Ваша група змінилась", self.send_message_mock.await_args[0][1])
+
+        deliveries = await self.deliveries()
+        self.assertEqual(len(deliveries), 1)
+        self.assertEqual(deliveries[0].recipient_group, "4.1")

@@ -22,7 +22,7 @@ with patch.dict(
     },
 ):
     from src.database.models import Base, PowerOnSourceState
-    from src.poweron.groups import PowerOnGroupResolver, SourceIdentityError
+    from src.poweron.groups import GroupRefreshResult, PowerOnGroupResolver, SourceIdentityError
 
 
 class GroupResolverTests(unittest.IsolatedAsyncioTestCase):
@@ -89,7 +89,11 @@ class GroupResolverTests(unittest.IsolatedAsyncioTestCase):
     async def test_cold_success_binds_city_and_persists_group(self) -> None:
         resolver = self.resolver()
 
-        self.assertEqual(await resolver.ensure_group(), "2.2")
+        result = await resolver.ensure_group()
+        assert result is not None
+        self.assertIsInstance(result, GroupRefreshResult)
+        self.assertEqual(result.group, "2.2")
+        self.assertFalse(result.group_changed)
 
         state = await self.state()
         assert state.last_refresh_attempt_at is not None
@@ -108,19 +112,29 @@ class GroupResolverTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fresh_success_is_reused_for_one_hour(self) -> None:
         resolver = self.resolver()
-        self.assertEqual(await resolver.ensure_group(), "2.2")
+        res1 = await resolver.ensure_group()
+        assert res1 is not None
+        self.assertEqual(res1.group, "2.2")
         self.now += timedelta(minutes=59, seconds=59)
 
-        self.assertEqual(await resolver.ensure_group(), "2.2")
+        res2 = await resolver.ensure_group()
+        assert res2 is not None
+        self.assertEqual(res2.group, "2.2")
         self.assertEqual(len(self.requests), 1)
 
     async def test_refreshes_after_one_hour_and_replaces_group(self) -> None:
         resolver = self.resolver()
-        self.assertEqual(await resolver.ensure_group(), "2.2")
+        res_first = await resolver.ensure_group()
+        assert res_first is not None
+        self.assertEqual(res_first.group, "2.2")
         self.now += timedelta(hours=1)
         self.payload = {"buildingGroups": [{"chergGpv": "4.1"}]}
 
-        self.assertEqual(await resolver.ensure_group(), "4.1")
+        result = await resolver.ensure_group()
+        assert result is not None
+        self.assertEqual(result.group, "4.1")
+        self.assertTrue(result.group_changed)
+        self.assertEqual(result.previous_group, "2.2")
         self.assertEqual((await self.state()).group, "4.1")
         self.assertEqual(len(self.requests), 2)
 
@@ -171,7 +185,10 @@ class GroupResolverTests(unittest.IsolatedAsyncioTestCase):
                 self.content_type = content_type
                 resolver = self.resolver()
 
-                self.assertEqual(await resolver.ensure_group(), "3.3")
+                result = await resolver.ensure_group()
+                assert result is not None
+                self.assertEqual(result.group, "3.3")
+                self.assertFalse(result.group_changed)
                 self.assertEqual((await self.state()).group, "3.3")
                 self.now += timedelta(hours=2)
 
@@ -186,7 +203,10 @@ class GroupResolverTests(unittest.IsolatedAsyncioTestCase):
             self.requests.append(request)
             raise httpx.ConnectError("offline", request=request)
 
-        self.assertEqual(await self.resolver(fail).ensure_group(), "3.3")
+        result = await self.resolver(fail).ensure_group()
+        assert result is not None
+        self.assertEqual(result.group, "3.3")
+        self.assertFalse(result.group_changed)
         self.assertEqual((await self.state()).group, "3.3")
 
     async def test_timeout_and_malformed_json_retain_last_known_group(self) -> None:
@@ -217,7 +237,10 @@ class GroupResolverTests(unittest.IsolatedAsyncioTestCase):
                         state.last_refresh_attempt_at = self.now - timedelta(hours=2)
                         state.last_successful_refresh_at = self.now - timedelta(hours=2)
 
-                self.assertEqual(await self.resolver(handler).ensure_group(), "3.3")
+                result = await self.resolver(handler).ensure_group()
+                assert result is not None
+                self.assertEqual(result.group, "3.3")
+                self.assertFalse(result.group_changed)
                 self.assertEqual((await self.state()).group, "3.3")
                 self.now += timedelta(hours=2)
 
@@ -259,7 +282,13 @@ class GroupResolverTests(unittest.IsolatedAsyncioTestCase):
         second = asyncio.create_task(resolver.ensure_group())
         release.set()
 
-        self.assertEqual(await asyncio.gather(first, second), ["2.2", "2.2"])
+        results = await asyncio.gather(first, second)
+        checked_results = []
+        for r in results:
+            assert r is not None
+            checked_results.append(r)
+
+        self.assertEqual([r.group for r in checked_results], ["2.2", "2.2"])
         self.assertEqual(len(self.requests), 1)
 
     async def test_http_occurs_without_open_database_transaction(self) -> None:
@@ -274,7 +303,9 @@ class GroupResolverTests(unittest.IsolatedAsyncioTestCase):
                 headers={"content-type": "application/json"},
             )
 
-        self.assertEqual(await self.resolver(respond).ensure_group(), "2.2")
+        res = await self.resolver(respond).ensure_group()
+        assert res is not None
+        self.assertEqual(res.group, "2.2")
 
     async def test_source_identity_accepts_match_and_rejects_mismatch(self) -> None:
         resolver = self.resolver()

@@ -105,7 +105,9 @@ class KyivTimeTests(unittest.TestCase):
 
 class HandlerKyivDateTests(unittest.IsolatedAsyncioTestCase):
     async def call_handler(
-        self, handler: Callable[[types.Message], Awaitable[None]], now: datetime
+        self,
+        handler: Callable[[types.Message], Awaitable[None]],
+        now: datetime,
     ) -> datetime:
         service = SimpleNamespace(get_formatted_schedule=AsyncMock(return_value=("schedule", True)))
         message = types.Message.model_construct(

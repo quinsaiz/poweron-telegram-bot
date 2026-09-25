@@ -67,7 +67,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.monitor_refresh_state: StartupGroupRefreshState | None = None
 
         async def monitor(
-            _bot: Bot, *, startup_group_refresh_state: StartupGroupRefreshState
+            _bot: Bot,
+            *,
+            startup_group_refresh_state: StartupGroupRefreshState,
         ) -> None:
             self.monitor_task = asyncio.current_task()
             self.monitor_refresh_state = startup_group_refresh_state
@@ -150,7 +152,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             return 0
 
         async def retrying_monitor(
-            _bot: Bot, *, startup_group_refresh_state: StartupGroupRefreshState
+            _bot: Bot,
+            *,
+            startup_group_refresh_state: StartupGroupRefreshState,
         ) -> None:
             self.monitor_task = asyncio.current_task()
             self.monitor_refresh_state = startup_group_refresh_state
@@ -309,7 +313,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unexpected_scheduler_failure_is_reported_after_cleanup(self) -> None:
         async def failed_monitor(
-            _bot: Bot, *, startup_group_refresh_state: StartupGroupRefreshState
+            _bot: Bot,
+            *,
+            startup_group_refresh_state: StartupGroupRefreshState,
         ) -> None:
             self.assertIs(startup_group_refresh_state, StartupGroupRefreshState.SUCCEEDED)
             raise ValueError("scheduler failed")
@@ -374,7 +380,8 @@ class RuntimeHealthTests(unittest.IsolatedAsyncioTestCase):
         return health
 
     async def _health_with_completing_worker(
-        self, worker: str
+        self,
+        worker: str,
     ) -> tuple[main.RuntimeHealth, asyncio.Event]:
         health = main.RuntimeHealth(startup_completed=True)
         polling_started = asyncio.Event()

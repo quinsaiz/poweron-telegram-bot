@@ -38,6 +38,23 @@ class GroupDiscoveryError(RuntimeError):
     pass
 
 
+class GroupRefreshResult(str):
+    previous_group: str | None
+
+    def __new__(cls, group: str, previous_group: str | None = None) -> GroupRefreshResult:
+        obj = super().__new__(cls, group)
+        obj.previous_group = previous_group
+        return obj
+
+    @property
+    def group(self) -> str:
+        return str(self)
+
+    @property
+    def group_changed(self) -> bool:
+        return self.previous_group is not None and self.previous_group != self
+
+
 @dataclass(frozen=True)
 class SourceSnapshot:
     group: str | None
@@ -64,6 +81,7 @@ class PowerOnGroupResolver:
         self.transport = transport
         self._lock = asyncio.Lock()
         self._group_url = f"{settings.POWERON_API_URL}/pw-accounts/building-groups"
+        self._pending_group_change: tuple[str, str] | None = None
 
     def _now(self) -> datetime:
         value = self.clock()
@@ -170,14 +188,24 @@ class PowerOnGroupResolver:
 
         if old_group is not None and old_group != group:
             logger.info("poweron group changed from %s to %s", old_group, group)
+            self._pending_group_change = (old_group, group)
         return group
 
-    async def ensure_group(self) -> str | None:
+    def consume_group_change(self) -> tuple[str, str] | None:
+        change = self._pending_group_change
+        self._pending_group_change = None
+        return change
+
+    async def ensure_group(self) -> GroupRefreshResult | None:
         async with self._lock:
             snapshot = await self._load_or_create_source()
             attempted_at = self._now()
             if not self._refresh_due(snapshot, attempted_at):
-                return snapshot.group
+                return (
+                    GroupRefreshResult(snapshot.group, previous_group=snapshot.group)
+                    if snapshot.group is not None
+                    else None
+                )
 
             try:
                 group = await self._fetch_group()
@@ -186,9 +214,14 @@ class PowerOnGroupResolver:
             except (GroupDiscoveryError, ValidationError, ValueError, httpx.HTTPError) as error:
                 await self._record_failure(attempted_at)
                 logger.warning("poweron group refresh failed: %s", type(error).__name__)
-                return snapshot.group
+                return (
+                    GroupRefreshResult(snapshot.group, previous_group=snapshot.group)
+                    if snapshot.group is not None
+                    else None
+                )
 
-            return await self._record_success(group, attempted_at)
+            new_group = await self._record_success(group, attempted_at)
+            return GroupRefreshResult(new_group, previous_group=snapshot.group)
 
 
 group_resolver = PowerOnGroupResolver()
