@@ -329,7 +329,7 @@ class PowerService:
             ("time", settings.POWERON_CITY_ID),
         ]
 
-        logger.info("Making API request...")
+        # logger.info("Requesting service schedule for date range and group...")
         async with httpx.AsyncClient(
             headers=self.headers, follow_redirects=True, timeout=30.0
         ) as client:
