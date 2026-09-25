@@ -12,12 +12,14 @@ duplicate after restart; all ordinary completed deliveries are unique by
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, assert_never
 
+import httpx
 from aiogram import Bot  # noqa: TC002  # runtime scheduler annotation reflection
 from aiogram.exceptions import (
     ClientDecodeError,
@@ -26,21 +28,25 @@ from aiogram.exceptions import (
     TelegramNotFound,
     TelegramRetryAfter,
 )
+from pydantic import ValidationError
 from sqlalchemy import delete, or_, select, update
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm.exc import StaleDataError
 
 from src.config import settings
 from src.database.engine import async_session
+from src.database.errors import TRANSIENT_DATABASE_EXCEPTIONS
 from src.database.models import NotificationDelivery, ProcessedScheduleEvent, User
+from src.database.source_state import source_authority_transaction
 from src.domain_time import utc_now
 from src.logger import setup_logger
+from src.poweron.groups import SourceIdentityError
 from src.poweron.service import PowerService, ScheduleFetchResult
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from datetime import date
 
+    from sqlalchemy.exc import SQLAlchemyError
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from src.poweron.schemas import ScheduleMember
@@ -53,6 +59,13 @@ MAX_TRANSIENT_ATTEMPTS = 5
 BASE_BACKOFF_SECONDS = 60
 MAX_BACKOFF_SECONDS = 3600
 MAX_ERROR_LENGTH = 500
+BOT_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:bot)?[0-9]+:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"
+)
+EXPECTED_PERSISTENCE_EXCEPTIONS: tuple[type[SQLAlchemyError], ...] = (
+    *TRANSIENT_DATABASE_EXCEPTIONS,
+    StaleDataError,
+)
 
 
 class DeliveryStatus(StrEnum):
@@ -67,6 +80,13 @@ class EventPersistenceResult(StrEnum):
     EXISTING_COMPATIBLE = "existing_compatible"
     EXISTING_INCOMPATIBLE = "existing_incompatible"
     FAILED = "failed"
+    STALE_AUTHORITY = "stale_authority"
+
+
+class StartupGroupRefreshState(StrEnum):
+    NOT_ATTEMPTED = "not_attempted"
+    SUCCEEDED = "succeeded"
+    TRANSIENT_FAILURE = "transient_failure"
 
 
 @dataclass(frozen=True)
@@ -92,9 +112,7 @@ def _sanitize_error(error: BaseException) -> str:
         return f"TelegramRetryAfter: retry after {error.retry_after}s"
 
     description = " ".join(str(error).split())
-    if settings.BOT_TOKEN:
-        description = description.replace(settings.BOT_TOKEN, "[redacted]")
-    description = re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot[redacted]", description)
+    description = BOT_TOKEN_PATTERN.sub("[redacted-bot-token]", description)
     result = f"{type(error).__name__}: {description}" if description else type(error).__name__
     return result[:MAX_ERROR_LENGTH]
 
@@ -135,35 +153,41 @@ class ScheduleScheduler:
 
     async def discover_events(self) -> int:
         async with self._discovery_lock:
-            fetch = await self.service.fetch_schedule()
-            return await self._persist_usable_events(fetch)
+            city_id = settings.POWERON_CITY_ID
+            group = await self.service.group_resolver.ensure_group()
+            if group is None:
+                logger.warning("Skipping schedule discovery: PowerOn group is unavailable")
+                return 0
+            try:
+                fetch = await self.service.fetch_schedule(group)
+            except asyncio.CancelledError:
+                raise
+            except (httpx.HTTPError, json.JSONDecodeError, ValidationError) as error:
+                logger.warning(
+                    "PowerOn schedule discovery is unavailable: %s",
+                    type(error).__name__,
+                )
+                return 0
+            return await self._persist_usable_events(fetch, city_id, group)
 
     def _prepare_event(
         self,
         event: ScheduleMember,
-        subscribed_groups: set[str],
+        group: str,
         relevant_dates: frozenset[date],
         discovered_at: datetime,
     ) -> PreparedEvent | None:
-        available_groups = (
-            {group for group in event.data_json if isinstance(group, str)}
-            if isinstance(event.data_json, dict)
-            else set()
-        )
-        usable = self.service.usable_event(event, available_groups, relevant_dates)
+        usable = self.service.usable_event(event, {group}, relevant_dates)
         if usable is None:
             logger.warning("Ignoring unusable schedule event id=%s", event.id)
             return None
-        if subscribed_groups and not subscribed_groups.intersection(usable.group_times):
-            logger.warning("Ignoring schedule event id=%s without a subscribed group", event.id)
-            return None
 
         messages: dict[str, str] = {}
-        for group, times in usable.group_times.items():
+        for event_group, times in usable.group_times.items():
             try:
-                messages[group] = self.service.render_notification(
+                messages[event_group] = self.service.render_notification(
                     times,
-                    group,
+                    event_group,
                     usable.event_date,
                     discovered_at,
                     now=discovered_at,
@@ -172,12 +196,11 @@ class ScheduleScheduler:
                 logger.warning(
                     "Could not render schedule event id=%s group=%s: %s",
                     event.id,
-                    group,
+                    event_group,
                     _sanitize_error(error),
                 )
 
-        required_groups = subscribed_groups or set(usable.group_times)
-        if not required_groups.intersection(messages):
+        if group not in messages:
             logger.warning("Ignoring unrenderable schedule event id=%s", event.id)
             return None
         return PreparedEvent(usable, messages)
@@ -199,7 +222,7 @@ class ScheduleScheduler:
     def _reconcile_events(
         self,
         fetch: ScheduleFetchResult,
-        subscribed_groups: set[str],
+        group: str,
         discovered_at: datetime,
     ) -> list[PreparedEvent]:
         if fetch.response is None:
@@ -211,9 +234,7 @@ class ScheduleScheduler:
             if event.id is None:
                 logger.warning("Ignoring schedule event without a valid id")
                 continue
-            prepared = self._prepare_event(
-                event, subscribed_groups, fetch.relevant_dates, discovered_at
-            )
+            prepared = self._prepare_event(event, group, fetch.relevant_dates, discovered_at)
             if prepared is None:
                 continue
             event_id = prepared.usable.event_id
@@ -236,16 +257,22 @@ class ScheduleScheduler:
         return accepted
 
     async def _persist_event(
-        self, prepared: PreparedEvent, users: list[User], discovered_at: datetime
+        self,
+        prepared: PreparedEvent,
+        users: list[User],
+        discovered_at: datetime,
+        city_id: int,
+        group: str,
     ) -> EventPersistenceResult:
         usable = prepared.usable
+        recipient_group, message = next(iter(prepared.messages.items()))
         deliveries = [
             NotificationDelivery(
                 event_id=usable.event_id,
                 chat_id=user.chat_id,
-                recipient_group=user.group,
+                recipient_group=recipient_group,
                 event_date=usable.event_date.isoformat(),
-                message=prepared.messages[user.group],
+                message=message,
                 status=DeliveryStatus.PENDING.value,
                 attempt_count=0,
                 next_attempt_at=None,
@@ -255,11 +282,21 @@ class ScheduleScheduler:
                 last_error=None,
             )
             for user in users
-            if user.group in prepared.messages
         ]
 
         try:
-            async with self.session_factory() as session:
+            async with source_authority_transaction(
+                self.session_factory,
+                city_id=city_id,
+                group=group,
+            ) as session:
+                if session is None:
+                    logger.info(
+                        "Skipping stale schedule event id=%s for group=%s",
+                        usable.event_id,
+                        group,
+                    )
+                    return EventPersistenceResult.STALE_AUTHORITY
                 existing = await session.get(ProcessedScheduleEvent, usable.event_id)
                 if existing is not None:
                     if existing.date_graph != usable.date_graph:
@@ -281,13 +318,18 @@ class ScheduleScheduler:
                 # before its children while retaining one atomic transaction.
                 await session.flush()
                 session.add_all(deliveries)
-                await session.commit()
             return EventPersistenceResult.CREATED
-        except Exception:
+        except EXPECTED_PERSISTENCE_EXCEPTIONS:
             logger.exception("Could not persist schedule event id=%s", usable.event_id)
             return EventPersistenceResult.FAILED
 
-    async def _refresh_cache(self, accepted: list[PreparedEvent], discovered_at: datetime) -> None:
+    async def _refresh_cache(
+        self,
+        accepted: list[PreparedEvent],
+        discovered_at: datetime,
+        city_id: int,
+        expected_group: str,
+    ) -> None:
         candidates: dict[tuple[str, str], list[dict[str, str]]] = {}
         for prepared in accepted:
             date_graph = prepared.usable.event_date.isoformat()
@@ -304,11 +346,22 @@ class ScheduleScheduler:
                 )
                 continue
             try:
-                async with self.session_factory() as session, session.begin():
+                async with source_authority_transaction(
+                    self.session_factory,
+                    city_id=city_id,
+                    group=expected_group,
+                ) as session:
+                    if session is None:
+                        logger.info(
+                            "Skipping stale schedule cache for %s, group=%s",
+                            date_graph,
+                            group,
+                        )
+                        return
                     await self.service.upsert_schedule_cache(
                         session, date_graph, group, first, discovered_at
                     )
-            except DBAPIError, StaleDataError:
+            except EXPECTED_PERSISTENCE_EXCEPTIONS:
                 # Events and deliveries were committed first; one cache-key failure
                 # cannot roll them back or prevent independent keys from refreshing.
                 logger.exception(
@@ -316,26 +369,27 @@ class ScheduleScheduler:
                     date_graph,
                     group,
                 )
-            except Exception:
-                logger.exception(
-                    "Unexpected cache refresh failure for %s, group %s",
-                    date_graph,
-                    group,
-                )
 
-    async def _persist_usable_events(self, fetch: ScheduleFetchResult) -> int:
+    async def _persist_usable_events(
+        self, fetch: ScheduleFetchResult, city_id: int, group: str
+    ) -> int:
         if fetch.response is None or not fetch.response.events:
             logger.info("The schedule is empty or unavailable.")
             return 0
 
         users = await self._load_users()
-        subscribed_groups = {user.group for user in users}
         discovered_at = self._clock_now()
-        accepted = self._reconcile_events(fetch, subscribed_groups, discovered_at)
+        accepted = self._reconcile_events(fetch, group, discovered_at)
         persisted = 0
         cacheable: list[PreparedEvent] = []
         for prepared in accepted:
-            result = await self._persist_event(prepared, users, discovered_at)
+            result = await self._persist_event(
+                prepared,
+                users,
+                discovered_at,
+                city_id,
+                group,
+            )
             match result:
                 case EventPersistenceResult.CREATED:
                     persisted += 1
@@ -344,9 +398,11 @@ class ScheduleScheduler:
                     cacheable.append(prepared)
                 case EventPersistenceResult.EXISTING_INCOMPATIBLE | EventPersistenceResult.FAILED:
                     pass
+                case EventPersistenceResult.STALE_AUTHORITY:
+                    return persisted
                 case _ as unreachable:
                     assert_never(unreachable)
-        await self._refresh_cache(cacheable, discovered_at)
+        await self._refresh_cache(cacheable, discovered_at, city_id, group)
         return persisted
 
     async def _due_delivery_ids(self, now: datetime) -> list[int]:
@@ -500,28 +556,101 @@ class ScheduleScheduler:
                     sent += await self._deliver_one(delivery_id)
                 except asyncio.CancelledError:
                     raise
-                except DBAPIError:
+                except TRANSIENT_DATABASE_EXCEPTIONS:
                     logger.exception("Could not update delivery id=%s", delivery_id)
-                except Exception:
-                    logger.exception("Unexpected delivery processing error id=%s", delivery_id)
             return sent
 
-    async def _run_phase(self, name: str, phase: Callable[[], Awaitable[object]]) -> None:
+    async def _run_phase(self, name: str, phase: Callable[[], Awaitable[object]]) -> bool:
         try:
             await phase()
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except SourceIdentityError:
+            raise
+        except TRANSIENT_DATABASE_EXCEPTIONS:
             logger.exception("%s failed; scheduler will retry", name)
+            return False
+        return True
 
-    async def run(self) -> None:
-        await self._run_phase("Startup delivery scan", self.process_due_deliveries)
+    async def _confirm_source_identity(self) -> bool:
+        try:
+            await self.service.group_resolver.ensure_source_identity()
+        except asyncio.CancelledError:
+            raise
+        except SourceIdentityError:
+            raise
+        except TRANSIENT_DATABASE_EXCEPTIONS:
+            logger.exception("PowerOn source identity check failed; scheduler will retry")
+            return False
+        return True
+
+    async def _complete_startup_phases(
+        self,
+        refresh_state: StartupGroupRefreshState,
+        delivery_scanned: bool,
+    ) -> tuple[bool, bool]:
+        if refresh_state is StartupGroupRefreshState.TRANSIENT_FAILURE:
+            if not delivery_scanned:
+                await self._run_phase("Startup delivery scan", self.process_due_deliveries)
+                delivery_scanned = True
+            await self.sleep(self.poll_interval)
+            return False, delivery_scanned
+
+        if refresh_state is StartupGroupRefreshState.NOT_ATTEMPTED:
+            refresh_succeeded = await self._run_phase(
+                "Startup group refresh", self.service.group_resolver.ensure_group
+            )
+            if not delivery_scanned:
+                await self._run_phase("Startup delivery scan", self.process_due_deliveries)
+                delivery_scanned = True
+            if not refresh_succeeded:
+                await self.sleep(self.poll_interval)
+                return False, delivery_scanned
+        elif refresh_state is not StartupGroupRefreshState.SUCCEEDED:
+            assert_never(refresh_state)
+
+        if not delivery_scanned:
+            await self._run_phase("Startup delivery scan", self.process_due_deliveries)
+            delivery_scanned = True
+        return True, delivery_scanned
+
+    async def run(
+        self,
+        startup_group_refresh_state: StartupGroupRefreshState = (
+            StartupGroupRefreshState.NOT_ATTEMPTED
+        ),
+    ) -> None:
+        identity_confirmed = False
+        startup_phases_complete = False
+        startup_delivery_scanned = False
         while True:
+            if not identity_confirmed:
+                identity_confirmed = await self._confirm_source_identity()
+                if not identity_confirmed:
+                    await self.sleep(self.poll_interval)
+                    continue
+            if not startup_phases_complete:
+                (
+                    startup_phases_complete,
+                    startup_delivery_scanned,
+                ) = await self._complete_startup_phases(
+                    startup_group_refresh_state,
+                    startup_delivery_scanned,
+                )
+                startup_group_refresh_state = StartupGroupRefreshState.NOT_ATTEMPTED
+                if not startup_phases_complete:
+                    continue
             logger.info("Checking for schedule updates...")
             await self._run_phase("Schedule discovery", self.discover_events)
             await self._run_phase("Post-discovery delivery scan", self.process_due_deliveries)
             await self.sleep(self.poll_interval)
 
 
-async def check_updates_loop(bot: Bot) -> None:
-    await ScheduleScheduler(bot).run()
+async def check_updates_loop(
+    bot: Bot,
+    *,
+    startup_group_refresh_state: StartupGroupRefreshState = (
+        StartupGroupRefreshState.NOT_ATTEMPTED
+    ),
+) -> None:
+    await ScheduleScheduler(bot).run(startup_group_refresh_state)

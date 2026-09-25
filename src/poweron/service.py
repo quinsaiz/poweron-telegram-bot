@@ -17,9 +17,11 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from src.config import settings
 from src.database.engine import async_session
-from src.database.models import ScheduleCache, User
+from src.database.models import ScheduleCache
+from src.database.source_state import source_authority_transaction
 from src.domain_time import KYIV_TZ, as_kyiv, kyiv_now, utc_now
 from src.logger import setup_logger
+from src.poweron.groups import PowerOnGroupResolver, group_resolver
 from src.poweron.schemas import GroupData, ScheduleMember, ScheduleResponse, parse_date_graph
 from src.poweron.utils import format_date_ua, format_schedule, get_current_status
 
@@ -31,6 +33,7 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__, settings.LOG_LEVEL)
 TIME_PATTERN = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 VALID_STATUSES = {"0", "1", "10"}
+GROUP_UNAVAILABLE_MESSAGE = "⚠️ **Інформація про групу тимчасово недоступна. Спробуйте пізніше.**"
 
 
 @dataclass(frozen=True)
@@ -68,11 +71,17 @@ class CacheRefreshResult:
 
 
 class PowerService:
-    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        resolver: PowerOnGroupResolver | None = None,
+    ) -> None:
         self.clock = clock or utc_now
-        city_id_base64 = base64.b64encode(str(settings.CITY_ID).encode()).decode()
+        self.group_resolver = resolver or group_resolver
+        city_id_base64 = base64.b64encode(str(settings.POWERON_CITY_ID).encode()).decode()
 
-        self.base_url = settings.API_URL
+        self.schedule_url = f"{settings.POWERON_API_URL}/a_gpv_g"
         self.headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0",
             "Referer": "https://poweron.toe.com.ua/",
@@ -99,7 +108,7 @@ class PowerService:
 
     @staticmethod
     async def get_schedule_from_cache(
-        date_str: str, group: str = "3.2", allow_stale: bool = False
+        date_str: str, group: str, allow_stale: bool = False
     ) -> tuple[dict[str, str] | None, datetime | None]:
         async with async_session() as session:
             result = await session.execute(
@@ -177,6 +186,28 @@ class PowerService:
                 raise
 
             logger.info("Cache saved for %s, group %s", date_str, group)
+
+    @classmethod
+    async def save_authoritative_schedule_to_cache(
+        cls,
+        date_str: str,
+        group: str,
+        times_dict: dict[str, str],
+        *,
+        city_id: int,
+    ) -> bool:
+        async with source_authority_transaction(
+            async_session,
+            city_id=city_id,
+            group=group,
+        ) as session:
+            if session is None:
+                logger.info("Skipping stale schedule cache for %s, group=%s", date_str, group)
+                return False
+            await cls.upsert_schedule_cache(session, date_str, group, times_dict, utc_now())
+
+        logger.info("Cache saved for %s, group %s", date_str, group)
+        return True
 
     @staticmethod
     def valid_times(times: dict[str, str]) -> bool:
@@ -279,7 +310,7 @@ class PowerService:
         caption = cls.render_schedule_caption(times, group, event_date, discovered_at, now=now)
         return f"🔔 **ОПУБЛІКОВАНО ОНОВЛЕННЯ!**\n\n{caption}"
 
-    async def fetch_schedule(self, date: datetime | None = None) -> ScheduleFetchResult:
+    async def fetch_schedule(self, group: str, date: datetime | None = None) -> ScheduleFetchResult:
         if date is None:
             window = self.discovery_fetch_window(self.clock())
             after_dt = window.after
@@ -291,43 +322,43 @@ class PowerService:
             before_dt = requested_midnight + timedelta(days=1, hours=12)
             relevant_dates = frozenset((date.date(),))
 
-        params: dict[str, str | int] = {
-            "before": before_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-            "after": after_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-            "time": settings.CITY_ID,
-        }
+        params: list[tuple[str, str | int | float | bool | None]] = [
+            ("before", before_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")),
+            ("after", after_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")),
+            ("group[]", group),
+            ("time", settings.POWERON_CITY_ID),
+        ]
 
         logger.info("Making API request...")
         async with httpx.AsyncClient(
             headers=self.headers, follow_redirects=True, timeout=30.0
         ) as client:
-            response = await client.get(self.base_url, params=params)
+            response = await client.get(self.schedule_url, params=params)
 
         if response.status_code != 200:
-            logger.error("Error %s: %s", response.status_code, response.text[:200])
+            logger.error("PowerOn schedule request failed with status %s", response.status_code)
             return ScheduleFetchResult(None, relevant_dates)
 
         schedule = ScheduleResponse.model_validate(response.json())
         return ScheduleFetchResult(schedule, relevant_dates)
 
     async def refresh_schedule(
-        self, group: str | None = None, date: datetime | None = None
+        self, group: str, date: datetime | None = None
     ) -> CacheRefreshResult:
-        target_group = group or settings.DEFAULT_GROUP
-        fetch = await self.fetch_schedule(date)
+        city_id = settings.POWERON_CITY_ID
+        fetch = await self.fetch_schedule(group, date)
         if fetch.response is None or not fetch.response.events:
             return CacheRefreshResult(fetch, (), ())
 
         usable_events = tuple(
             usable
             for event in fetch.response.events
-            if (usable := self.usable_event(event, {target_group}, fetch.relevant_dates))
-            is not None
+            if (usable := self.usable_event(event, {group}, fetch.relevant_dates)) is not None
         )
         candidates: dict[str, list[dict[str, str]]] = {}
         for usable in usable_events:
             candidates.setdefault(usable.event_date.isoformat(), []).append(
-                usable.group_times[target_group]
+                usable.group_times[group]
             )
 
         cached_dates: list[str] = []
@@ -337,16 +368,23 @@ class PowerService:
                 logger.warning(
                     "Ambiguous upstream schedules for %s, group %s; cache unchanged",
                     date_graph,
-                    target_group,
+                    group,
                 )
                 continue
-            await self.save_schedule_to_cache(date_graph, target_group, first_schedule)
+            saved = await self.save_authoritative_schedule_to_cache(
+                date_graph,
+                group,
+                first_schedule,
+                city_id=city_id,
+            )
+            if not saved:
+                break
             cached_dates.append(date_graph)
 
         return CacheRefreshResult(fetch, usable_events, tuple(cached_dates))
 
     async def get_schedule(
-        self, group: str | None = None, date: datetime | None = None
+        self, group: str, date: datetime | None = None
     ) -> ScheduleResponse | None:
         refresh = await self.refresh_schedule(group, date)
         if not refresh.has_usable_event:
@@ -354,12 +392,12 @@ class PowerService:
         return refresh.fetch.response
 
     async def get_formatted_schedule(self, chat_id: int, date: datetime) -> tuple[str, bool]:
+        del chat_id
         date_str = date.strftime("%Y-%m-%d")
         date_display = format_date_ua(date)
-        async with async_session() as session:
-            result = await session.execute(select(User).where(User.chat_id == chat_id))
-            user = result.scalar_one_or_none()
-            user_group = user.group if user else settings.DEFAULT_GROUP
+        user_group = await self.group_resolver.ensure_group()
+        if user_group is None:
+            return GROUP_UNAVAILABLE_MESSAGE, False
 
         cached_times, updated_at = await self.get_schedule_from_cache(date_str, user_group)
 

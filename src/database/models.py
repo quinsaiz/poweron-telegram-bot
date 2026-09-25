@@ -23,7 +23,24 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     chat_id: Mapped[int] = mapped_column(BigInteger, unique=True)
-    group: Mapped[str] = mapped_column(String, default="3.2")
+
+
+class PowerOnSourceState(Base):
+    __tablename__ = "poweron_source_state"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_poweron_source_state_singleton"),
+        CheckConstraint("city_id > 0", name="ck_poweron_source_state_city_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    city_id: Mapped[int] = mapped_column(Integer)
+    group: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_refresh_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_successful_refresh_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class ScheduleCache(Base):
@@ -32,7 +49,7 @@ class ScheduleCache(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     date_graph: Mapped[str] = mapped_column(String)
-    group: Mapped[str] = mapped_column(String, default="3.2")
+    group: Mapped[str] = mapped_column(String)
     times_json: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
 import unittest
 from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
@@ -19,10 +21,17 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-with patch.dict(os.environ, {"BOT_TOKEN": "test-only-token"}):
+with patch.dict(
+    os.environ,
+    {
+        "BOT_TOKEN": "test-only-token",
+        "POWERON_CITY_ID": "21005",
+        "POWERON_API_URL": "https://api-poweron.toe.com.ua/api",
+    },
+):
     from src.poweron import service as service_module
 
-from src.database.models import Base, ScheduleCache, User
+from src.database.models import Base, PowerOnSourceState, ScheduleCache, User
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -44,7 +53,7 @@ class DiscoveryFetchWindowTests(unittest.IsolatedAsyncioTestCase):
             "AsyncClient",
             side_effect=lambda **kwargs: real_client(transport=transport, **kwargs),
         ):
-            result = await service.fetch_schedule()
+            result = await service.fetch_schedule("3.2")
 
         self.assertEqual(len(requests), 1)
         return dict(requests[0].url.params), result.relevant_dates
@@ -154,19 +163,41 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         self.session = async_sessionmaker(self.engine, expire_on_commit=False)
+        async with self.session() as session, session.begin():
+            session.add(
+                PowerOnSourceState(
+                    id=1,
+                    city_id=21005,
+                    group=self.group,
+                    last_refresh_attempt_at=datetime.now(UTC),
+                    last_successful_refresh_at=datetime.now(UTC),
+                )
+            )
         self.session_patch = patch.object(service_module, "async_session", self.session)
         self.session_patch.start()
         self.addCleanup(self.session_patch.stop)
-        self.service = service_module.PowerService()
+        self.resolver = SimpleNamespace(ensure_group=AsyncMock(return_value=self.group))
+        self.service = service_module.PowerService(resolver=self.resolver)
         self.requests = []
 
     async def asyncTearDown(self):
         await self.engine.dispose()
 
     async def add_user(self, group="3.2"):
+        self.resolver.ensure_group.return_value = group
         async with self.session() as session:
-            session.add(User(chat_id=self.chat_id, group=group))
+            state = await session.get(PowerOnSourceState, 1)
+            assert state is not None
+            state.group = group
+            session.add(User(chat_id=self.chat_id))
             await session.commit()
+
+    async def set_authoritative_group(self, group: str) -> None:
+        self.resolver.ensure_group.return_value = group
+        async with self.session() as session, session.begin():
+            state = await session.get(PowerOnSourceState, 1)
+            assert state is not None
+            state.group = group
 
     async def add_cache(self, date_str=None, group="3.2", age_minutes=31):
         async with self.session() as session:
@@ -248,6 +279,62 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🟢 Є світло", text)
         self.assertEqual(self.requests, [])
 
+    async def test_unavailable_group_does_not_request_schedule(self):
+        self.resolver.ensure_group.return_value = None
+        self.mock_api(error=True)
+
+        text, ok = await self.service.get_formatted_schedule(self.chat_id, self.date)
+
+        self.assertFalse(ok)
+        self.assertIn("Інформація про групу тимчасово недоступна", text)
+        self.assertEqual(self.requests, [])
+
+    async def test_group_change_does_not_read_fresh_cache_for_old_group(self):
+        await self.add_cache(group="3.2", age_minutes=1)
+        await self.set_authoritative_group("4.1")
+        self.mock_api(times={"00:00": "1"}, group="4.1")
+
+        text, ok = await self.service.get_formatted_schedule(self.chat_id, self.date)
+
+        self.assertTrue(ok)
+        self.assertIn("Група: **4.1**", text)
+        self.assertEqual(self.requests[0].url.params.get_list("group[]"), ["4.1"])
+        async with self.session() as session:
+            rows = (await session.execute(select(ScheduleCache))).scalars().all()
+        self.assertEqual({row.group for row in rows}, {"3.2", "4.1"})
+
+    async def test_group_change_during_fetch_does_not_cache_stale_group(self) -> None:
+        fetch_started = asyncio.Event()
+        release_fetch = asyncio.Event()
+
+        async def fetch(_group: str, _date: datetime | None = None):
+            fetch_started.set()
+            await release_fetch.wait()
+            response = service_module.ScheduleResponse.model_validate(
+                {
+                    "hydra:member": [
+                        {
+                            "id": "stale-a",
+                            "dateGraph": f"{self.date_str}T00:00:00+03:00",
+                            "dataJson": {"3.2": {"times": {"00:00": "1"}}},
+                        }
+                    ]
+                }
+            )
+            return service_module.ScheduleFetchResult(response, frozenset((self.date.date(),)))
+
+        with patch.object(self.service, "fetch_schedule", side_effect=fetch):
+            refresh = asyncio.create_task(self.service.refresh_schedule("3.2", self.date))
+            await fetch_started.wait()
+            await self.set_authoritative_group("4.1")
+            release_fetch.set()
+            result = await refresh
+
+        self.assertEqual(result.cached_dates, ())
+        self.assertEqual(
+            await self.service.get_schedule_from_cache(self.date_str, "3.2"), (None, None)
+        )
+
     async def test_expired_cache_is_refreshed_and_persisted(self):
         await self.add_user()
         await self.add_cache()
@@ -261,6 +348,13 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.requests[0].url.params["after"], "2024-01-14T12:00:00+00:00")
         self.assertEqual(self.requests[0].url.params["before"], "2024-01-16T12:00:00+00:00")
+        self.assertEqual(self.requests[0].url.params.get_list("group[]"), ["3.2"])
+        self.assertEqual(self.requests[0].url.params["time"], "21005")
+        self.assertEqual(self.requests[0].headers["X-debug-key"], "MjEwMDU=")
+        self.assertEqual(
+            str(self.requests[0].url.copy_with(query=None)),
+            "https://api-poweron.toe.com.ua/api/a_gpv_g",
+        )
         async with self.session() as session:
             cache = (await session.execute(select(ScheduleCache))).scalar_one()
         self.assertEqual(json.loads(cache.times_json), {"00:00": "1", "12:30": "10"})
@@ -444,7 +538,7 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
         self.mock_api(times={"24:00": "1"})
 
         with patch.object(
-            self.service, "save_schedule_to_cache", new_callable=AsyncMock
+            self.service, "save_authoritative_schedule_to_cache", new_callable=AsyncMock
         ) as save_cache:
             text, ok = await self.service.get_formatted_schedule(self.chat_id, self.date)
 
@@ -502,7 +596,9 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
                 with (
                     self.isolated_api(times=times, group=target_group),
                     patch.object(
-                        self.service, "save_schedule_to_cache", new_callable=AsyncMock
+                        self.service,
+                        "save_authoritative_schedule_to_cache",
+                        new_callable=AsyncMock,
                     ) as save_cache,
                 ):
                     save_cache.reset_mock()
@@ -520,7 +616,11 @@ class ScheduleCacheTests(unittest.IsolatedAsyncioTestCase):
                 request = self.requests[0]
                 self.assertEqual(request.url.params["after"], "2024-01-14T12:00:00+00:00")
                 self.assertEqual(request.url.params["before"], "2024-01-16T12:00:00+00:00")
-                self.assertEqual(request.url.params["time"], str(service_module.settings.CITY_ID))
+                self.assertEqual(
+                    request.url.params["time"],
+                    str(service_module.settings.POWERON_CITY_ID),
+                )
+                self.assertEqual(request.url.params.get_list("group[]"), [target_group])
                 self.assertEqual(actual, expected)
                 async with self.session() as session:
                     stale = (

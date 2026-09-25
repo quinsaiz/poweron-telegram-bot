@@ -8,10 +8,23 @@ from typing import get_type_hints
 from unittest.mock import AsyncMock, patch
 
 from aiogram import Bot
+from sqlalchemy.exc import ArgumentError, InvalidRequestError, OperationalError
 
-with patch.dict(os.environ, {"BOT_TOKEN": "123:test-only-token"}):
+with patch.dict(
+    os.environ,
+    {
+        "BOT_TOKEN": "123:test-only-token",
+        "POWERON_CITY_ID": "21005",
+        "POWERON_API_URL": "https://api-poweron.toe.com.ua/api",
+    },
+):
     from src import main
-    from src.poweron.scheduler import check_updates_loop
+    from src.poweron.groups import SourceIdentityError
+    from src.poweron.scheduler import (
+        ScheduleScheduler,
+        StartupGroupRefreshState,
+        check_updates_loop,
+    )
     from src.telegram.middlewares import AntiFloodMiddleware
 
 
@@ -49,9 +62,11 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.monitor_started = asyncio.Event()
         self.monitor_finished = asyncio.Event()
         self.monitor_task = None
+        self.monitor_refresh_state = None
 
-        async def monitor(_bot):
+        async def monitor(_bot, *, startup_group_refresh_state):
             self.monitor_task = asyncio.current_task()
+            self.monitor_refresh_state = startup_group_refresh_state
             self.monitor_started.set()
             try:
                 await asyncio.Event().wait()
@@ -64,6 +79,17 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.patches.enter_context(patch.object(main, "engine", self.engine))
         self.patches.enter_context(patch.object(main, "check_updates_loop", monitor))
+        self.ensure_source_identity = self.patches.enter_context(
+            patch.object(main.group_resolver, "ensure_source_identity", new_callable=AsyncMock)
+        )
+        self.ensure_group = self.patches.enter_context(
+            patch.object(
+                main.group_resolver,
+                "ensure_group",
+                new_callable=AsyncMock,
+                return_value="2.2",
+            )
+        )
 
     async def test_shutdown_stops_polling_cancels_scheduler_and_closes_resources(self):
         async with main.lifespan(main.app):
@@ -79,6 +105,113 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.monitor_finished.is_set())
         self.assertTrue(self.monitor_task.done())
         self.assertTrue(self.monitor_task.cancelled())
+        self.ensure_group.assert_awaited_once_with()
+        self.assertIs(self.monitor_refresh_state, StartupGroupRefreshState.SUCCEEDED)
+        self.session.close.assert_awaited_once_with()
+        self.engine.dispose.assert_awaited_once_with()
+
+    async def test_source_mismatch_fails_before_workers_start(self):
+        self.ensure_source_identity.side_effect = SourceIdentityError("configured city mismatch")
+
+        with self.assertRaisesRegex(SourceIdentityError, "city mismatch"):
+            async with main.lifespan(main.app):
+                self.fail("lifespan must not start")
+
+        self.assertFalse(self.dispatcher.started.is_set())
+        self.assertFalse(self.monitor_started.is_set())
+        self.ensure_group.assert_not_awaited()
+
+    async def test_transient_initial_group_state_failure_still_starts_workers_and_retries(self):
+        failure = OperationalError("SELECT source state", {}, Exception("temporary"))
+        self.ensure_group.side_effect = [failure, "2.2"]
+        wait_started = asyncio.Event()
+        release_wait = asyncio.Event()
+        discovery_resumed = asyncio.Event()
+        pending_scan = AsyncMock(return_value=0)
+
+        async def controlled_wait(_delay: float) -> None:
+            wait_started.set()
+            await release_wait.wait()
+
+        async def resumed_discovery() -> int:
+            discovery_resumed.set()
+            await asyncio.Event().wait()
+            return 0
+
+        async def retrying_monitor(_bot, *, startup_group_refresh_state):
+            self.monitor_task = asyncio.current_task()
+            self.monitor_refresh_state = startup_group_refresh_state
+            self.monitor_started.set()
+            try:
+                scheduler = ScheduleScheduler(
+                    _bot,
+                    service=SimpleNamespace(group_resolver=main.group_resolver),
+                    sleep=controlled_wait,
+                )
+                with (
+                    patch.object(scheduler, "process_due_deliveries", pending_scan),
+                    patch.object(scheduler, "discover_events", side_effect=resumed_discovery),
+                ):
+                    await scheduler.run(startup_group_refresh_state)
+            finally:
+                self.monitor_finished.set()
+
+        self.patches.enter_context(patch.object(main, "check_updates_loop", retrying_monitor))
+
+        with self.assertLogs(main.logger, level="ERROR") as logs:
+            async with main.lifespan(main.app):
+                await self.dispatcher.started.wait()
+                await self.monitor_started.wait()
+                await wait_started.wait()
+                self.assertIs(
+                    self.monitor_refresh_state,
+                    StartupGroupRefreshState.TRANSIENT_FAILURE,
+                )
+                self.assertEqual(self.ensure_group.await_count, 1)
+                pending_scan.assert_awaited_once_with()
+                release_wait.set()
+                await discovery_resumed.wait()
+                self.assertEqual(self.ensure_group.await_count, 2)
+
+        self.assertIn("Initial PowerOn group refresh failed", "\n".join(logs.output))
+        self.assertTrue(self.dispatcher.polling_finished.is_set())
+        self.assertTrue(self.monitor_finished.is_set())
+        self.session.close.assert_awaited_once_with()
+        self.engine.dispose.assert_awaited_once_with()
+
+    async def test_initial_group_refresh_cancellation_is_not_swallowed(self):
+        self.ensure_group.side_effect = asyncio.CancelledError
+
+        with self.assertRaises(asyncio.CancelledError):
+            async with main.lifespan(main.app):
+                self.fail("lifespan must not start")
+
+        self.assertFalse(self.dispatcher.started.is_set())
+        self.assertFalse(self.monitor_started.is_set())
+        self.session.close.assert_awaited_once_with()
+        self.engine.dispose.assert_awaited_once_with()
+
+    async def test_invalid_request_during_initial_group_refresh_is_fatal(self):
+        self.ensure_group.side_effect = InvalidRequestError("broken session state")
+
+        with self.assertRaisesRegex(InvalidRequestError, "broken session state"):
+            async with main.lifespan(main.app):
+                self.fail("lifespan must not start")
+
+        self.assertFalse(self.dispatcher.started.is_set())
+        self.assertFalse(self.monitor_started.is_set())
+        self.session.close.assert_awaited_once_with()
+        self.engine.dispose.assert_awaited_once_with()
+
+    async def test_argument_error_during_initial_group_refresh_is_fatal(self):
+        self.ensure_group.side_effect = ArgumentError("invalid statement construction")
+
+        with self.assertRaisesRegex(ArgumentError, "invalid statement construction"):
+            async with main.lifespan(main.app):
+                self.fail("lifespan must not start")
+
+        self.assertFalse(self.dispatcher.started.is_set())
+        self.assertFalse(self.monitor_started.is_set())
         self.session.close.assert_awaited_once_with()
         self.engine.dispose.assert_awaited_once_with()
 
@@ -158,7 +291,8 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.dispatcher.polling_task.done())
 
     async def test_unexpected_scheduler_failure_is_reported_after_cleanup(self):
-        async def failed_monitor(_bot):
+        async def failed_monitor(_bot, *, startup_group_refresh_state):
+            self.assertIs(startup_group_refresh_state, StartupGroupRefreshState.SUCCEEDED)
             raise ValueError("scheduler failed")
 
         self.patches.enter_context(patch.object(main, "check_updates_loop", failed_monitor))

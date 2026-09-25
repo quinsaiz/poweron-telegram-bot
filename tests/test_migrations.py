@@ -16,12 +16,20 @@ from sqlalchemy.pool import NullPool
 from src.database.config import DatabaseSettings
 from src.database.models import Base, ScheduleCache
 
-with patch.dict(os.environ, {"BOT_TOKEN": "test-only-token"}):
+with patch.dict(
+    os.environ,
+    {
+        "BOT_TOKEN": "test-only-token",
+        "POWERON_CITY_ID": "21005",
+        "POWERON_API_URL": "https://api-poweron.toe.com.ua/api",
+    },
+):
     from src.poweron import service as service_module
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INITIAL_REVISION = "initial_schema"
-HEAD_REVISION = "f412bdd7c3e0"
+PREVIOUS_HEAD_REVISION = "f412bdd7c3e0"
+HEAD_REVISION = "poweron_source_state"
 MIGRATIONS_ROOT = PROJECT_ROOT / "migrations"
 VERSIONS_ROOT = MIGRATIONS_ROOT / "versions"
 
@@ -145,6 +153,34 @@ class StandardAlembicTests(unittest.TestCase):
             inspector.get_unique_constraints("users"),
             [{"name": None, "column_names": ["chat_id"]}],
         )
+        self.assertEqual(
+            {column["name"] for column in inspector.get_columns("users")},
+            {"id", "chat_id"},
+        )
+
+    def test_previous_head_upgrade_removes_user_group_and_preserves_chat_id(self) -> None:
+        previous = run_alembic(self.url, "upgrade", PREVIOUS_HEAD_REVISION)
+        self.assertEqual(previous.returncode, 0, previous.stderr)
+        with self.engine.begin() as connection:
+            connection.execute(text("INSERT INTO users (chat_id, \"group\") VALUES (7, '4.1')"))
+
+        upgrade = run_alembic(self.url, "upgrade", "head")
+
+        self.assertEqual(upgrade.returncode, 0, upgrade.stderr)
+        self.assertEqual(self.revision(), HEAD_REVISION)
+        self.assertEqual(
+            {column["name"] for column in inspect(self.engine).get_columns("users")},
+            {"id", "chat_id"},
+        )
+        with self.engine.connect() as connection:
+            self.assertEqual(connection.scalar(text("SELECT chat_id FROM users")), 7)
+
+        downgrade = run_alembic(self.url, "downgrade", PREVIOUS_HEAD_REVISION)
+        self.assertEqual(downgrade.returncode, 0, downgrade.stderr)
+        columns = {column["name"] for column in inspect(self.engine).get_columns("users")}
+        self.assertEqual(columns, {"id", "chat_id", "group"})
+        with self.engine.connect() as connection:
+            self.assertEqual(connection.scalar(text('SELECT "group" FROM users')), "3.2")
 
     def test_outbox_constraints_foreign_key_and_due_index(self) -> None:
         self.upgrade()
@@ -227,7 +263,7 @@ class StandardAlembicTests(unittest.TestCase):
             )
 
     def test_autogenerate_revision_uses_template_only_in_temporary_environment(self) -> None:
-        real_versions = file_tree(VERSIONS_ROOT)
+        real_migrations = file_tree(MIGRATIONS_ROOT)
         copied_root = Path(self.temp_dir.name) / "copied-environment"
         copied_migrations = copied_root / "migrations"
         copied_versions = copied_migrations / "versions"
@@ -239,6 +275,9 @@ class StandardAlembicTests(unittest.TestCase):
             MIGRATIONS_ROOT / "script.py.mako",
             copied_migrations / "script.py.mako",
         )
+        preexisting_cache = copied_versions / "__pycache__" / "preexisting-cache.pyc"
+        preexisting_cache.parent.mkdir(exist_ok=True)
+        preexisting_cache.write_bytes(b"pre-existing cache sentinel")
         copied_config = copied_root / "alembic.ini"
         copied_versions_before = file_tree(copied_versions)
 
@@ -281,11 +320,11 @@ class StandardAlembicTests(unittest.TestCase):
         self.assertIsNone(module.depends_on)
         module.upgrade()
         module.downgrade()
-        self.assertEqual(file_tree(VERSIONS_ROOT), real_versions)
         self.assertEqual(
-            [path for path in MIGRATIONS_ROOT.rglob("__pycache__") if path.is_dir()],
-            [],
+            preexisting_cache.read_bytes(),
+            b"pre-existing cache sentinel",
         )
+        self.assertEqual(file_tree(MIGRATIONS_ROOT), real_migrations)
 
 
 class MigrationConfigurationTests(unittest.TestCase):

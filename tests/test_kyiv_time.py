@@ -8,7 +8,14 @@ from unittest.mock import AsyncMock, patch
 from src.domain_time import KYIV_TZ, as_kyiv
 from src.poweron.utils import get_current_status
 
-with patch.dict(os.environ, {"BOT_TOKEN": "123:test-only-token"}):
+with patch.dict(
+    os.environ,
+    {
+        "BOT_TOKEN": "123:test-only-token",
+        "POWERON_CITY_ID": "21005",
+        "POWERON_API_URL": "https://api-poweron.toe.com.ua/api",
+    },
+):
     from src.poweron.service import PowerService
     from src.telegram import handlers
 

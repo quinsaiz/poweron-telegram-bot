@@ -4,16 +4,13 @@ from aiogram import F, Router, types
 from aiogram.filters import Command
 from sqlalchemy import select
 
-from src.config import settings
 from src.database.engine import async_session
 from src.database.models import User
 from src.domain_time import kyiv_now
-from src.logger import setup_logger
 from src.poweron.service import PowerService
 from src.telegram.utils import get_main_keyboard
 
 router = Router()
-logger = setup_logger(__name__, settings.LOG_LEVEL)
 
 
 @router.message(Command("start"))
@@ -25,27 +22,30 @@ async def cmd_start(message: types.Message) -> None:
         result = await session.execute(select(User).where(User.chat_id == message.from_user.id))
         user = result.scalar_one_or_none()
 
-        if not user:
-            new_user = User(chat_id=message.from_user.id, group=settings.DEFAULT_GROUP)
-            session.add(new_user)
+        is_new_user = user is None
+        if is_new_user:
+            session.add(User(chat_id=message.from_user.id))
             await session.commit()
-            await message.answer(
-                "👋 Вітаю!\n\n"
-                f"🏘 Ваша група: **{settings.DEFAULT_GROUP}**\n\n"
-                "Використовуйте кнопки нижче або команди:\n"
-                "• /today - графік на сьогодні\n"
-                "• /tomorrow - графік на завтра\n"
-                "Також ви можете просто написати сьогодні або завтра\n",
-                reply_markup=get_main_keyboard(),
-                parse_mode="Markdown",
-            )
-        else:
-            await message.answer(
-                "З поверненням! 👋\n\n"
-                "Використовуйте кнопки або просто напишіть **сьогодні** або **завтра**",
-                reply_markup=get_main_keyboard(),
-                parse_mode="Markdown",
-            )
+
+    service = PowerService()
+    group = await service.group_resolver.ensure_group()
+    greeting = "👋 Вітаю!" if is_new_user else "З поверненням! 👋"
+    if group is None:
+        await message.answer(
+            f"{greeting}\n\n⚠️ Інформація про групу тимчасово недоступна. Спробуйте пізніше.",
+            reply_markup=get_main_keyboard(),
+        )
+    else:
+        await message.answer(
+            f"{greeting}\n\n"
+            f"🏘 Ваша група визначена автоматично: **{group}**\n\n"
+            "Використовуйте кнопки нижче або команди:\n"
+            "• /today - графік на сьогодні\n"
+            "• /tomorrow - графік на завтра\n"
+            "Також ви можете просто написати сьогодні або завтра\n",
+            reply_markup=get_main_keyboard(),
+            parse_mode="Markdown",
+        )
 
 
 @router.message(Command("help"))

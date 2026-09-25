@@ -17,7 +17,12 @@ def default_database_url() -> str:
 class DatabaseSettings(BaseSettings):
     DATABASE_URL: str = Field(default_factory=default_database_url)
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        hide_input_in_errors=True,
+    )
 
 
 database_settings = DatabaseSettings()

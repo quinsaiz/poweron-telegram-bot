@@ -8,8 +8,10 @@ from fastapi import FastAPI
 
 from src.config import settings
 from src.database.engine import engine
+from src.database.errors import TRANSIENT_DATABASE_EXCEPTIONS
 from src.logger import setup_logger
-from src.poweron.scheduler import check_updates_loop
+from src.poweron.groups import group_resolver
+from src.poweron.scheduler import StartupGroupRefreshState, check_updates_loop
 from src.telegram.bot import bot, dp
 from src.telegram.handlers import router as telegram_router
 from src.telegram.middlewares import AntiFloodMiddleware
@@ -182,6 +184,15 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     monitor_task = None
     try:
         logger.info("Starting bot services...")
+        await group_resolver.ensure_source_identity()
+        startup_group_refresh_state = StartupGroupRefreshState.SUCCEEDED
+        try:
+            await group_resolver.ensure_group()
+        except asyncio.CancelledError:
+            raise
+        except TRANSIENT_DATABASE_EXCEPTIONS:
+            logger.exception("Initial PowerOn group refresh failed; scheduler will retry")
+            startup_group_refresh_state = StartupGroupRefreshState.TRANSIENT_FAILURE
         polling_task = asyncio.create_task(
             dp.start_polling(
                 bot,
@@ -190,7 +201,12 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
                 close_bot_session=False,
             ),
         )
-        monitor_task = asyncio.create_task(check_updates_loop(bot))
+        monitor_task = asyncio.create_task(
+            check_updates_loop(
+                bot,
+                startup_group_refresh_state=startup_group_refresh_state,
+            )
+        )
         yield
     finally:
         await _shutdown(polling_task, monitor_task)

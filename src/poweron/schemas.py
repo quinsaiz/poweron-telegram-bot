@@ -20,6 +20,7 @@ DATE_GRAPH_PATTERN = re.compile(
     r"T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
     r"(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
 )
+GROUP_PATTERN = re.compile(r"[0-9]+\.[0-9]+")
 
 
 def parse_date_graph(value: str | None) -> datetime | None:
@@ -33,6 +34,31 @@ def parse_date_graph(value: str | None) -> datetime | None:
 
 class GroupData(BaseModel):
     times: dict[str, str]
+
+
+class BuildingGroup(BaseModel):
+    cherg_gpv: StrictStr = Field(..., alias="chergGpv", min_length=1, max_length=32)
+
+    @field_validator("cherg_gpv")
+    @classmethod
+    def normalize_group(cls, value: str) -> str:
+        normalized = value.strip()
+        if GROUP_PATTERN.fullmatch(normalized) is None:
+            raise ValueError("group must use ASCII dotted numeric syntax")
+        return normalized
+
+
+class BuildingGroupsResponse(BaseModel):
+    building_groups: list[BuildingGroup] = Field(
+        ..., alias="buildingGroups", min_length=0, max_length=100
+    )
+
+    def normalized_groups(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(item.cherg_gpv for item in self.building_groups))
+
+    def authoritative_group(self) -> str | None:
+        groups = self.normalized_groups()
+        return groups[0] if len(groups) == 1 else None
 
 
 class ScheduleMember(BaseModel):

@@ -10,7 +10,79 @@ from poweron_live_fixtures import (
     live_half_hour_times,
 )
 from pydantic import ValidationError
-from src.poweron.schemas import ScheduleResponse, parse_date_graph
+from src.poweron.schemas import BuildingGroupsResponse, ScheduleResponse, parse_date_graph
+
+
+class BuildingGroupsResponseTests(unittest.TestCase):
+    def test_exact_singleton_is_authoritative(self) -> None:
+        response = BuildingGroupsResponse.model_validate({"buildingGroups": [{"chergGpv": "2.2"}]})
+
+        self.assertEqual(response.normalized_groups(), ("2.2",))
+        self.assertEqual(response.authoritative_group(), "2.2")
+
+    def test_whitespace_and_unknown_fields_are_accepted(self) -> None:
+        response = BuildingGroupsResponse.model_validate(
+            {
+                "buildingGroups": [{"chergGpv": " 2.2 ", "future": True}],
+                "futureTopLevel": {},
+            }
+        )
+
+        self.assertEqual(response.authoritative_group(), "2.2")
+
+    def test_identical_duplicates_normalize_to_one_group(self) -> None:
+        response = BuildingGroupsResponse.model_validate(
+            {"buildingGroups": [{"chergGpv": "2.2"}, {"chergGpv": " 2.2 "}]}
+        )
+
+        self.assertEqual(response.normalized_groups(), ("2.2",))
+        self.assertEqual(response.authoritative_group(), "2.2")
+
+    def test_distinct_groups_are_ambiguous_in_stable_order(self) -> None:
+        response = BuildingGroupsResponse.model_validate(
+            {
+                "buildingGroups": [
+                    {"chergGpv": "4.1"},
+                    {"chergGpv": "2.2"},
+                    {"chergGpv": "4.1"},
+                ]
+            }
+        )
+
+        self.assertEqual(response.normalized_groups(), ("4.1", "2.2"))
+        self.assertIsNone(response.authoritative_group())
+
+    def test_empty_list_is_not_authoritative(self) -> None:
+        response = BuildingGroupsResponse.model_validate({"buildingGroups": []})
+
+        self.assertIsNone(response.authoritative_group())
+
+    def test_wrong_types_and_malformed_fields_are_rejected(self) -> None:
+        invalid_payloads = (
+            {},
+            {"buildingGroups": None},
+            {"buildingGroups": {}},
+            {"buildingGroups": [{}]},
+            {"buildingGroups": [{"chergGpv": None}]},
+            {"buildingGroups": [{"chergGpv": 2.2}]},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload), self.assertRaises(ValidationError):
+                BuildingGroupsResponse.model_validate(payload)
+
+    def test_invalid_group_grammar_is_rejected(self) -> None:
+        invalid_groups = ("2", "2.", ".2", "2.2.1", "2,2", "２.２", "-2.2", "a.b")
+        for group in invalid_groups:
+            with self.subTest(group=group), self.assertRaises(ValidationError):
+                BuildingGroupsResponse.model_validate({"buildingGroups": [{"chergGpv": group}]})
+
+    def test_size_bounds_are_enforced(self) -> None:
+        with self.assertRaises(ValidationError):
+            BuildingGroupsResponse.model_validate(
+                {"buildingGroups": [{"chergGpv": "1" * 31 + ".1"}]}
+            )
+        with self.assertRaises(ValidationError):
+            BuildingGroupsResponse.model_validate({"buildingGroups": [{"chergGpv": "2.2"}] * 101})
 
 
 class ScheduleResponseTests(unittest.TestCase):

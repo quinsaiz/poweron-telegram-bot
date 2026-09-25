@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -6,8 +8,10 @@ import unittest
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramForbiddenError,
@@ -23,27 +27,52 @@ from poweron_live_fixtures import (
     live_collection,
     live_half_hour_times,
 )
+from pydantic import ValidationError
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import (
+    ArgumentError,
+    IntegrityError,
+    InterfaceError,
+    InvalidRequestError,
+    OperationalError,
+    PendingRollbackError,
+    ProgrammingError,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-TEST_BOT_TOKEN = "123:test-only-token"
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
-with patch.dict(os.environ, {"BOT_TOKEN": TEST_BOT_TOKEN}):
+TEST_BOT_TOKEN = "123:test-only-token"
+TOKEN_SHAPED_SECRET = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+
+with patch.dict(
+    os.environ,
+    {
+        "BOT_TOKEN": TEST_BOT_TOKEN,
+        "POWERON_CITY_ID": "21005",
+        "POWERON_API_URL": "https://api-poweron.toe.com.ua/api",
+    },
+):
+    from src.database import source_state as source_state_module
     from src.database.engine import configure_sqlite_foreign_keys
     from src.database.models import (
         Base,
         NotificationDelivery,
+        PowerOnSourceState,
         ProcessedScheduleEvent,
         ScheduleCache,
         User,
     )
+    from src.poweron.groups import PowerOnGroupResolver, SourceIdentityError
     from src.poweron.scheduler import (
         DeliveryStatus,
         EventPersistenceResult,
         PreparedEvent,
         ScheduleScheduler,
+        StartupGroupRefreshState,
+        _sanitize_error,
     )
     from src.poweron.schemas import ScheduleResponse
     from src.poweron.service import PowerService, ScheduleFetchResult
@@ -62,10 +91,24 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         self.session = async_sessionmaker(self.engine, expire_on_commit=False)
-        self.addAsyncCleanup(self.engine.dispose)
         self.now = datetime(2026, 9, 22, 9, 0, 0, tzinfo=UTC)
+        async with self.session() as session, session.begin():
+            session.add(
+                PowerOnSourceState(
+                    id=1,
+                    city_id=21005,
+                    group="3.2",
+                    last_refresh_attempt_at=self.now,
+                    last_successful_refresh_at=self.now,
+                )
+            )
+        self.addAsyncCleanup(self.engine.dispose)
         self.bot = SimpleNamespace(send_message=AsyncMock(return_value=object()))
-        self.service = PowerService()
+        self.resolver = SimpleNamespace(
+            ensure_group=AsyncMock(return_value="3.2"),
+            ensure_source_identity=AsyncMock(),
+        )
+        self.service = PowerService(resolver=self.resolver)
         self.service.fetch_schedule = AsyncMock()  # type: ignore[method-assign]
         self.scheduler = ScheduleScheduler(
             self.bot,
@@ -111,15 +154,42 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(fetch.response)
         assert fetch.response is not None
         prepared = self.scheduler._prepare_event(
-            fetch.response.events[0], {"3.2"}, fetch.relevant_dates, self.now
+            fetch.response.events[0], "3.2", fetch.relevant_dates, self.now
         )
         self.assertIsNotNone(prepared)
         assert prepared is not None
         return prepared
 
     async def add_users(self, *users: tuple[int, str]) -> None:
+        if users:
+            self.resolver.ensure_group.return_value = users[0][1]
         async with self.session() as session, session.begin():
-            session.add_all(User(chat_id=chat_id, group=group) for chat_id, group in users)
+            if users:
+                state = await session.get(PowerOnSourceState, 1)
+                assert state is not None
+                state.group = users[0][1]
+            session.add_all(User(chat_id=chat_id) for chat_id, _group in users)
+
+    async def set_authoritative_group(self, group: str) -> None:
+        async with self.session() as session, session.begin():
+            state = await session.get(PowerOnSourceState, 1)
+            assert state is not None
+            state.group = group
+
+    def real_resolver_returning(self, group: str) -> PowerOnGroupResolver:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.params["cityId"], "21005")
+            return httpx.Response(
+                200,
+                json={"buildingGroups": [{"chergGpv": group}]},
+                headers={"Content-Type": "application/json"},
+            )
+
+        return PowerOnGroupResolver(
+            session_factory=self.session,
+            clock=lambda: self.now + timedelta(hours=1),
+            transport=httpx.MockTransport(handler),
+        )
 
     async def events(self) -> list[ProcessedScheduleEvent]:
         async with self.session() as session:
@@ -175,7 +245,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await session.flush()
             if add_user:
-                session.add(User(chat_id=chat_id, group="3.2"))
+                session.add(User(chat_id=chat_id))
             session.add(
                 NotificationDelivery(
                     event_id=stored_event_id,
@@ -199,6 +269,91 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.scheduler.discover_events(), 0)
         self.assertEqual(await self.events(), [])
         self.assertEqual(await self.deliveries(), [])
+
+    async def test_expected_poweron_failures_retry_only_on_next_iteration(self) -> None:
+        await self.add_cache(times={"00:00": "10"})
+        await self.seed_delivery(event_id="existing")
+        request = httpx.Request("GET", "https://example.test/api/a_gpv_g")
+        response = httpx.Response(503, request=request)
+        try:
+            ScheduleResponse.model_validate({"hydra:member": None})
+        except ValidationError as error:
+            schema_error = error
+        else:  # pragma: no cover - the schema must reject this fixture
+            self.fail("invalid schedule fixture was accepted")
+
+        failures = (
+            httpx.ReadTimeout("fake-secret-timeout", request=request),
+            httpx.ConnectError("fake-secret-transport", request=request),
+            httpx.HTTPStatusError(
+                "fake-secret-status",
+                request=request,
+                response=response,
+            ),
+            json.JSONDecodeError("fake-secret-json", "not-json", 0),
+            schema_error,
+        )
+        original_events = [event.event_id for event in await self.events()]
+        original_deliveries = [
+            (delivery.event_id, delivery.status, delivery.attempt_count, delivery.message)
+            for delivery in await self.deliveries()
+        ]
+        original_caches = [
+            (cache.date_graph, cache.group, cache.times_json) for cache in await self.caches()
+        ]
+
+        for failure in failures:
+            with self.subTest(exception=type(failure).__name__):
+                self.service.fetch_schedule.reset_mock(side_effect=True)
+                self.service.fetch_schedule.side_effect = [failure, asyncio.CancelledError()]
+                self.resolver.ensure_source_identity.reset_mock(side_effect=True)
+                self.resolver.ensure_source_identity.return_value = None
+                delivery_scan = AsyncMock(return_value=0)
+                normal_wait = AsyncMock(return_value=None)
+
+                with (
+                    patch.object(self.scheduler, "process_due_deliveries", delivery_scan),
+                    patch.object(self.scheduler, "sleep", normal_wait),
+                    self.assertLogs("src.poweron.scheduler", level="WARNING") as logs,
+                    self.assertRaises(asyncio.CancelledError),
+                ):
+                    await self.scheduler.run(StartupGroupRefreshState.SUCCEEDED)
+
+                self.assertEqual(self.service.fetch_schedule.await_count, 2)
+                normal_wait.assert_awaited_once_with(self.scheduler.poll_interval)
+                self.assertNotIn("fake-secret", "\n".join(logs.output))
+                self.assertEqual([event.event_id for event in await self.events()], original_events)
+                self.assertEqual(
+                    [
+                        (
+                            delivery.event_id,
+                            delivery.status,
+                            delivery.attempt_count,
+                            delivery.message,
+                        )
+                        for delivery in await self.deliveries()
+                    ],
+                    original_deliveries,
+                )
+                self.assertEqual(
+                    [
+                        (cache.date_graph, cache.group, cache.times_json)
+                        for cache in await self.caches()
+                    ],
+                    original_caches,
+                )
+
+    async def test_discovery_does_not_misclassify_database_or_local_failures(self) -> None:
+        failures = (
+            OperationalError("fetch", {}, Exception("database unavailable")),
+            RuntimeError("local bug"),
+        )
+        for failure in failures:
+            with self.subTest(exception=type(failure).__name__):
+                self.service.fetch_schedule.reset_mock(side_effect=True)
+                self.service.fetch_schedule.side_effect = failure
+                with self.assertRaises(type(failure)):
+                    await self.scheduler.discover_events()
 
     async def test_naive_scheduler_clock_is_rejected(self) -> None:
         self.scheduler.clock = lambda: datetime(2026, 4, 10, 12, 0)
@@ -233,6 +388,202 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.scheduler.discover_events(), 0)
         self.assertEqual(await self.events(), [])
         self.assertEqual(await self.deliveries(), [])
+
+    async def test_discovery_requests_only_the_effective_group(self) -> None:
+        await self.add_users((10, "3.2"))
+        self.service.fetch_schedule.return_value = self.response(self.event(1))
+
+        self.assertEqual(await self.scheduler.discover_events(), 1)
+
+        self.service.fetch_schedule.assert_awaited_once_with("3.2")
+
+    async def test_group_change_while_fetch_is_in_flight_rejects_stale_persistence(self) -> None:
+        await self.add_users((10, "3.2"))
+        await self.seed_delivery(event_id="pending-before-change", add_user=False)
+        fetch_started = asyncio.Event()
+        release_fetch = asyncio.Event()
+
+        async def fetch(group: str) -> ScheduleFetchResult:
+            self.assertEqual(group, "3.2")
+            fetch_started.set()
+            await release_fetch.wait()
+            return self.response(self.event("stale-a"))
+
+        self.service.fetch_schedule.side_effect = fetch
+        discovery = asyncio.create_task(self.scheduler.discover_events())
+        await fetch_started.wait()
+        self.assertEqual(await self.real_resolver_returning("4.1").ensure_group(), "4.1")
+        release_fetch.set()
+
+        self.assertEqual(await discovery, 0)
+        self.assertEqual(
+            [event.event_id for event in await self.events()], ["pending-before-change"]
+        )
+        self.assertEqual(await self.caches(), [])
+        before = (await self.deliveries())[0]
+        self.assertEqual(before.recipient_group, "3.2")
+        self.assertEqual(before.message, "message-10")
+
+        self.assertEqual(await self.scheduler.process_due_deliveries(), 1)
+        delivered = (await self.deliveries())[0]
+        self.assertEqual(delivered.status, DeliveryStatus.SENT.value)
+        self.assertEqual(delivered.recipient_group, "3.2")
+        self.assertEqual(delivered.message, "message-10")
+
+        self.resolver.ensure_group.return_value = "4.1"
+        self.service.fetch_schedule.side_effect = None
+        self.service.fetch_schedule.return_value = self.response(
+            self.event("current-b", {"4.1": {"00:00": "1"}})
+        )
+
+        self.assertEqual(await self.scheduler.discover_events(), 1)
+        self.assertEqual(
+            {event.event_id for event in await self.events()},
+            {"pending-before-change", "current-b"},
+        )
+        self.assertEqual({cache.group for cache in await self.caches()}, {"4.1"})
+        self.assertEqual(
+            {delivery.recipient_group for delivery in await self.deliveries()},
+            {"3.2", "4.1"},
+        )
+
+    async def test_event_write_rejects_lost_group_authority(self) -> None:
+        await self.add_users((10, "3.2"))
+        users = await self.scheduler._load_users()
+        prepared = self.prepared_event("stale-event")
+        self.assertEqual(await self.real_resolver_returning("4.1").ensure_group(), "4.1")
+
+        result = await self.scheduler._persist_event(
+            prepared,
+            users,
+            self.now,
+            21005,
+            "3.2",
+        )
+
+        self.assertIs(result, EventPersistenceResult.STALE_AUTHORITY)
+        self.assertEqual(await self.events(), [])
+        self.assertEqual(await self.deliveries(), [])
+
+    async def test_cache_write_rejects_lost_group_authority(self) -> None:
+        prepared = self.prepared_event("stale-cache")
+        self.assertEqual(await self.real_resolver_returning("4.1").ensure_group(), "4.1")
+
+        await self.scheduler._refresh_cache([prepared], self.now, 21005, "3.2")
+
+        self.assertEqual(await self.caches(), [])
+
+    async def _observe_authority_transaction_serialization(
+        self,
+        write: Callable[[], Awaitable[object]],
+    ) -> object:
+        authority_read = asyncio.Event()
+        release_authoritative_write = asyncio.Event()
+        group_update_waiting = asyncio.Event()
+        commit_order: list[str] = []
+        a_task: asyncio.Task[object] | None = None
+        b_task: asyncio.Task[object] | None = None
+        original_get = AsyncSession.get
+        original_commit = AsyncSession.commit
+
+        class ObservedLock:
+            def __init__(self) -> None:
+                self._lock = asyncio.Lock()
+
+            async def __aenter__(self) -> None:
+                if asyncio.current_task() is b_task:
+                    group_update_waiting.set()
+                await self._lock.acquire()
+
+            async def __aexit__(self, *_args: object) -> None:
+                self._lock.release()
+
+        async def gated_get(
+            session: AsyncSession,
+            entity: object,
+            ident: object,
+            *args: object,
+            **kwargs: object,
+        ) -> object:
+            result = await original_get(session, entity, ident, *args, **kwargs)
+            if asyncio.current_task() is a_task and entity is PowerOnSourceState:
+                authority_read.set()
+                await release_authoritative_write.wait()
+            return result
+
+        async def observed_commit(session: AsyncSession) -> None:
+            current = asyncio.current_task()
+            commits_group_b = any(
+                isinstance(value, PowerOnSourceState) and value.group == "4.1"
+                for value in session.dirty
+            )
+            await original_commit(session)
+            if current is a_task:
+                commit_order.append("A")
+            elif current is b_task and commits_group_b:
+                commit_order.append("B")
+
+        resolver = self.real_resolver_returning("4.1")
+        observed_lock = ObservedLock()
+        with (
+            patch.object(source_state_module, "_source_write_lock", observed_lock),
+            patch.object(AsyncSession, "get", gated_get),
+            patch.object(AsyncSession, "commit", observed_commit),
+        ):
+            a_task = asyncio.create_task(write())
+            try:
+                await asyncio.wait_for(authority_read.wait(), timeout=2.0)
+                b_task = asyncio.create_task(resolver.ensure_group())
+                await asyncio.wait_for(group_update_waiting.wait(), timeout=2.0)
+                self.assertFalse(b_task.done())
+                self.assertEqual(commit_order, [])
+            finally:
+                release_authoritative_write.set()
+
+            a_result = await asyncio.wait_for(a_task, timeout=2.0)
+            self.assertEqual(await asyncio.wait_for(b_task, timeout=2.0), "4.1")
+            self.assertEqual(commit_order, ["A", "B"])
+
+        async with self.session() as session:
+            state = await session.get(PowerOnSourceState, 1)
+            assert state is not None
+            self.assertEqual(state.group, "4.1")
+        return a_result
+
+    async def test_event_authority_guard_commits_before_waiting_group_update(self) -> None:
+        await self.add_users((10, "3.2"))
+        prepared = self.prepared_event("guarded-event")
+        users = await self.scheduler._load_users()
+
+        result = await self._observe_authority_transaction_serialization(
+            lambda: self.scheduler._persist_event(
+                prepared,
+                users,
+                self.now,
+                21005,
+                "3.2",
+            )
+        )
+
+        self.assertIs(result, EventPersistenceResult.CREATED)
+        self.assertEqual([row.event_id for row in await self.events()], ["guarded-event"])
+        self.assertEqual([row.recipient_group for row in await self.deliveries()], ["3.2"])
+
+    async def test_cache_authority_guard_commits_before_waiting_group_update(self) -> None:
+        prepared = self.prepared_event("guarded-cache")
+
+        await self._observe_authority_transaction_serialization(
+            lambda: self.scheduler._refresh_cache([prepared], self.now, 21005, "3.2")
+        )
+
+        self.assertEqual([row.group for row in await self.caches()], ["3.2"])
+
+    async def test_cold_group_unavailability_skips_discovery(self) -> None:
+        self.resolver.ensure_group.return_value = None
+
+        self.assertEqual(await self.scheduler.discover_events(), 0)
+
+        self.service.fetch_schedule.assert_not_awaited()
 
     async def test_date_relevance_uses_the_wire_calendar_date(self) -> None:
         await self.add_users((10, "3.2"))
@@ -381,7 +732,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({row.chat_id for row in rows}, {10, 20})
         self.assertEqual({row.status for row in rows}, {DeliveryStatus.PENDING.value})
 
-    async def test_groups_receive_their_own_immutable_message_snapshots(self) -> None:
+    async def test_all_users_receive_the_shared_immutable_group_snapshot(self) -> None:
         await self.add_users((10, "3.2"), (20, "4.1"))
         self.service.fetch_schedule.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "0"}, "4.1": {"00:00": "1"}})
@@ -389,11 +740,12 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
         await self.scheduler.discover_events()
 
-        rows = {row.recipient_group: row for row in await self.deliveries()}
-        self.assertIn("Група: **3.2**", rows["3.2"].message)
-        self.assertIn("🟢 Є світло", rows["3.2"].message)
-        self.assertIn("Група: **4.1**", rows["4.1"].message)
-        self.assertIn("🔴 Немає світла", rows["4.1"].message)
+        rows = await self.deliveries()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row.recipient_group for row in rows}, {"3.2"})
+        self.assertTrue(all("Група: **3.2**" in row.message for row in rows))
+        self.assertTrue(all("🟢 Є світло" in row.message for row in rows))
+        self.assertTrue(all("Група: **4.1**" not in row.message for row in rows))
 
     async def test_accepted_discovery_refreshes_existing_cache(self) -> None:
         await self.add_users((10, "3.2"))
@@ -413,11 +765,11 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         prepared = self.prepared_event(101)
 
         self.assertIs(
-            await self.scheduler._persist_event(prepared, users, self.now),
+            await self.scheduler._persist_event(prepared, users, self.now, 21005, "3.2"),
             EventPersistenceResult.CREATED,
         )
         self.assertIs(
-            await self.scheduler._persist_event(prepared, users, self.now),
+            await self.scheduler._persist_event(prepared, users, self.now, 21005, "3.2"),
             EventPersistenceResult.EXISTING_COMPATIBLE,
         )
 
@@ -429,7 +781,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             await session.commit()
 
         self.assertIs(
-            await self.scheduler._persist_event(prepared, users, self.now),
+            await self.scheduler._persist_event(prepared, users, self.now, 21005, "3.2"),
             EventPersistenceResult.EXISTING_INCOMPATIBLE,
         )
 
@@ -440,7 +792,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(AsyncSession, "commit", fail_commit):
             self.assertIs(
-                await self.scheduler._persist_event(failed_prepared, users, self.now),
+                await self.scheduler._persist_event(failed_prepared, users, self.now, 21005, "3.2"),
                 EventPersistenceResult.FAILED,
             )
 
@@ -452,6 +804,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
                 EventPersistenceResult.EXISTING_COMPATIBLE,
                 EventPersistenceResult.EXISTING_INCOMPATIBLE,
                 EventPersistenceResult.FAILED,
+                EventPersistenceResult.STALE_AUTHORITY,
             },
         )
         for result in EventPersistenceResult:
@@ -459,7 +812,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             EventPersistenceResult("created", True)
 
-    async def test_discovery_caches_multiple_groups_independently(self) -> None:
+    async def test_discovery_caches_only_the_authoritative_group(self) -> None:
         await self.add_users((10, "3.2"), (20, "4.1"))
         self.service.fetch_schedule.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "0"}, "4.1": {"00:00": "1"}})
@@ -469,7 +822,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             {row.group: json.loads(row.times_json) for row in await self.caches()},
-            {"3.2": {"00:00": "0"}, "4.1": {"00:00": "1"}},
+            {"3.2": {"00:00": "0"}},
         )
 
     async def test_invalid_discovery_schedule_does_not_overwrite_cache(self) -> None:
@@ -644,7 +997,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.deliveries(), [])
         self.assertEqual(json.loads((await self.caches())[0].times_json), {"00:00": "10"})
 
-    async def test_cache_write_failure_does_not_lose_durable_outbox(self) -> None:
+    async def test_authoritative_cache_write_failure_does_not_lose_durable_outbox(self) -> None:
         await self.add_users((10, "3.2"), (20, "4.1"))
         self.service.fetch_schedule.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "0"}, "4.1": {"00:00": "1"}})
@@ -661,10 +1014,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(await self.events()), 1)
         self.assertEqual(len(await self.deliveries()), 2)
-        self.assertEqual(
-            {row.group: json.loads(row.times_json) for row in await self.caches()},
-            {"4.1": {"00:00": "1"}},
-        )
+        self.assertEqual(await self.caches(), [])
 
     async def test_valid_event_without_subscribers_is_recorded_once(self) -> None:
         self.service.fetch_schedule.return_value = self.response(self.event(1))
@@ -692,6 +1042,112 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delivery.attempt_count, 1)
         self.assertEqual(self.aware(delivery.sent_at), self.now)
         self.assertIsNone(delivery.next_attempt_at)
+
+    async def test_due_delivery_load_retries_only_transient_database_failures(self) -> None:
+        await self.seed_delivery()
+        transient = OperationalError("load", {}, Exception("temporarily unavailable"))
+
+        with (
+            patch.object(self.scheduler, "_load_due_delivery", side_effect=transient),
+            self.assertLogs("src.poweron.scheduler", level="ERROR") as logs,
+        ):
+            self.assertEqual(await self.scheduler.process_due_deliveries(), 0)
+
+        delivery = (await self.deliveries())[0]
+        self.assertEqual(delivery.status, DeliveryStatus.PENDING.value)
+        self.assertEqual(delivery.attempt_count, 0)
+        self.assertIn("Could not update delivery", "\n".join(logs.output))
+
+        fatal = IntegrityError("load", {}, Exception("integrity"))
+        with (
+            patch.object(self.scheduler, "_load_due_delivery", side_effect=fatal),
+            self.assertRaises(IntegrityError),
+        ):
+            await self.scheduler.process_due_deliveries()
+
+    async def test_success_persistence_retries_only_transient_database_failures(self) -> None:
+        await self.seed_delivery()
+        transient = OperationalError("success", {}, Exception("temporarily unavailable"))
+
+        with (
+            patch.object(self.scheduler, "_record_success", side_effect=transient),
+            self.assertLogs("src.poweron.scheduler", level="ERROR"),
+        ):
+            self.assertEqual(await self.scheduler.process_due_deliveries(), 0)
+
+        delivery = (await self.deliveries())[0]
+        self.assertEqual(delivery.status, DeliveryStatus.PENDING.value)
+        self.assertEqual(delivery.attempt_count, 0)
+
+        fatal = ProgrammingError("success", {}, Exception("programming"))
+        with (
+            patch.object(self.scheduler, "_record_success", side_effect=fatal),
+            self.assertRaises(ProgrammingError),
+        ):
+            await self.scheduler.process_due_deliveries()
+
+    async def test_retry_persistence_retries_only_transient_database_failures(self) -> None:
+        await self.seed_delivery()
+        self.bot.send_message.side_effect = self.telegram_network_error()
+        transient = InterfaceError("retry", {}, Exception("connection unavailable"))
+
+        with (
+            patch.object(self.scheduler, "_record_transient_failure", side_effect=transient),
+            self.assertLogs("src.poweron.scheduler", level="ERROR"),
+        ):
+            self.assertEqual(await self.scheduler.process_due_deliveries(), 0)
+
+        delivery = (await self.deliveries())[0]
+        self.assertEqual(delivery.status, DeliveryStatus.PENDING.value)
+        self.assertEqual(delivery.attempt_count, 0)
+
+        fatal = InvalidRequestError("invalid session state")
+        with (
+            patch.object(self.scheduler, "_record_transient_failure", side_effect=fatal),
+            self.assertRaises(InvalidRequestError),
+        ):
+            await self.scheduler.process_due_deliveries()
+
+    async def test_terminal_persistence_retries_only_transient_database_failures(self) -> None:
+        await self.seed_delivery()
+        self.bot.send_message.side_effect = TelegramForbiddenError(
+            method=SendMessage(chat_id=10, text="test"), message="bot was blocked"
+        )
+        transient = OperationalError("terminal", {}, Exception("temporarily unavailable"))
+
+        with (
+            patch.object(self.scheduler, "_record_terminal_failure", side_effect=transient),
+            self.assertLogs("src.poweron.scheduler", level="ERROR"),
+        ):
+            self.assertEqual(await self.scheduler.process_due_deliveries(), 0)
+
+        delivery = (await self.deliveries())[0]
+        self.assertEqual(delivery.status, DeliveryStatus.PENDING.value)
+        self.assertEqual(delivery.attempt_count, 0)
+        async with self.session() as session:
+            user = await session.scalar(select(User).where(User.chat_id == 10))
+            self.assertIsNotNone(user)
+
+        fatal = PendingRollbackError("pending rollback")
+        with (
+            patch.object(self.scheduler, "_record_terminal_failure", side_effect=fatal),
+            self.assertRaises(PendingRollbackError),
+        ):
+            await self.scheduler.process_due_deliveries()
+
+    async def test_fatal_delivery_persistence_failure_stops_startup_phase(self) -> None:
+        await self.seed_delivery()
+        discovery = AsyncMock(return_value=0)
+        fatal = ArgumentError("invalid delivery statement")
+
+        with (
+            patch.object(self.scheduler, "_load_due_delivery", side_effect=fatal),
+            patch.object(self.scheduler, "discover_events", discovery),
+            self.assertRaises(ArgumentError),
+        ):
+            await self.scheduler.run(StartupGroupRefreshState.SUCCEEDED)
+
+        discovery.assert_not_awaited()
 
     async def test_one_failure_does_not_prevent_later_success(self) -> None:
         await self.seed_delivery(event_id=1, chat_id=10)
@@ -768,15 +1224,46 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
     async def test_last_error_is_bounded_and_redacts_bot_token(self) -> None:
         await self.seed_delivery()
         self.bot.send_message.side_effect = self.telegram_network_error(
-            f"request bot{TEST_BOT_TOKEN} {'x' * 1000}"
+            f"request bot{TOKEN_SHAPED_SECRET} failed upstream {'x' * 1000}"
         )
 
         await self.scheduler.process_due_deliveries()
 
         last_error = (await self.deliveries())[0].last_error or ""
         self.assertLessEqual(len(last_error), 500)
-        self.assertNotIn(TEST_BOT_TOKEN, last_error)
-        self.assertNotIn(f"bot{TEST_BOT_TOKEN}", last_error)
+        self.assertNotIn(TOKEN_SHAPED_SECRET, last_error)
+        self.assertIn("request [redacted-bot-token] failed upstream", last_error)
+
+    def test_sanitize_error_redacts_embedded_and_url_bot_tokens(self) -> None:
+        error = RuntimeError(
+            f"first {TOKEN_SHAPED_SECRET}; URL "
+            f"https://api.telegram.org/bot987654321:{'z' * 30}/sendMessage failed"
+        )
+        original = str(error)
+
+        sanitized = _sanitize_error(error)
+
+        self.assertEqual(sanitized.count("[redacted-bot-token]"), 2)
+        self.assertIn("first", sanitized)
+        self.assertIn("/sendMessage failed", sanitized)
+        self.assertNotIn(TOKEN_SHAPED_SECRET, sanitized)
+        self.assertEqual(str(error), original)
+
+    def test_sanitize_error_preserves_ordinary_colon_messages(self) -> None:
+        sanitized = _sanitize_error(RuntimeError("status: failure; reference 123:short"))
+
+        self.assertIn("status: failure", sanitized)
+        self.assertIn("123:short", sanitized)
+
+    def test_sanitize_error_truncates_without_unwrapping_configured_secret(self) -> None:
+        with patch("pydantic.SecretStr.get_secret_value", side_effect=AssertionError):
+            sanitized = _sanitize_error(
+                RuntimeError(f"prefix {TOKEN_SHAPED_SECRET} suffix {'x' * 1000}")
+            )
+
+        self.assertLessEqual(len(sanitized), 500)
+        self.assertIn("[redacted-bot-token]", sanitized)
+        self.assertNotIn(TOKEN_SHAPED_SECRET, sanitized)
 
     async def test_unexpected_local_exception_does_not_count_or_schedule_attempt(self) -> None:
         await self.seed_delivery()
@@ -877,7 +1364,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_processes_pending_before_discovering_new_events(self) -> None:
         await self.seed_delivery()
 
-        async def fetch() -> ScheduleFetchResult:
+        async def fetch(_group: str) -> ScheduleFetchResult:
             self.assertEqual((await self.deliveries())[0].status, DeliveryStatus.SENT.value)
             raise asyncio.CancelledError
 
@@ -886,6 +1373,206 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await self.scheduler.run()
         self.bot.send_message.assert_awaited_once()
+
+    async def test_run_retries_transient_identity_read_before_any_phase(self) -> None:
+        delivery = AsyncMock(return_value=0)
+        discovery = AsyncMock(side_effect=asyncio.CancelledError)
+
+        async def controlled_wait(_delay: float) -> None:
+            delivery.assert_not_awaited()
+            discovery.assert_not_awaited()
+
+        self.resolver.ensure_source_identity.side_effect = [
+            OperationalError("identity read", {}, Exception("simulated")),
+            None,
+        ]
+        self.scheduler.sleep = AsyncMock(side_effect=controlled_wait)
+
+        with (
+            patch.object(self.scheduler, "process_due_deliveries", delivery),
+            patch.object(self.scheduler, "discover_events", discovery),
+            self.assertLogs("src.poweron.scheduler", level="ERROR") as logs,
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await self.scheduler.run()
+
+        self.assertEqual(self.resolver.ensure_source_identity.await_count, 2)
+        self.scheduler.sleep.assert_awaited_once_with(self.scheduler.poll_interval)
+        delivery.assert_awaited_once_with()
+        discovery.assert_awaited_once_with()
+        self.assertIn("source identity check failed", "\n".join(logs.output))
+
+    async def test_run_treats_source_identity_mismatch_as_fatal(self) -> None:
+        delivery = AsyncMock(return_value=0)
+        discovery = AsyncMock(return_value=0)
+        self.resolver.ensure_source_identity.side_effect = SourceIdentityError("city mismatch")
+
+        with (
+            patch.object(self.scheduler, "process_due_deliveries", delivery),
+            patch.object(self.scheduler, "discover_events", discovery),
+            self.assertRaisesRegex(SourceIdentityError, "city mismatch"),
+        ):
+            await self.scheduler.run()
+
+        delivery.assert_not_awaited()
+        discovery.assert_not_awaited()
+
+    async def test_run_retries_interface_identity_failure(self) -> None:
+        delivery = AsyncMock(return_value=0)
+        discovery = AsyncMock(side_effect=asyncio.CancelledError)
+        self.resolver.ensure_source_identity.side_effect = [
+            InterfaceError("identity connection", {}, Exception("simulated")),
+            None,
+        ]
+        self.scheduler.sleep = AsyncMock(return_value=None)
+
+        with (
+            patch.object(self.scheduler, "process_due_deliveries", delivery),
+            patch.object(self.scheduler, "discover_events", discovery),
+            self.assertLogs("src.poweron.scheduler", level="ERROR"),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await self.scheduler.run()
+
+        self.assertEqual(self.resolver.ensure_source_identity.await_count, 2)
+        self.scheduler.sleep.assert_awaited_once_with(self.scheduler.poll_interval)
+        delivery.assert_awaited_once_with()
+        discovery.assert_awaited_once_with()
+
+    async def test_run_propagates_nontransient_sqlalchemy_identity_failures(self) -> None:
+        failures = (
+            InvalidRequestError("invalid request"),
+            ArgumentError("invalid argument"),
+            PendingRollbackError("pending rollback"),
+            IntegrityError("identity", {}, Exception("integrity")),
+            ProgrammingError("identity", {}, Exception("programming")),
+        )
+
+        for failure in failures:
+            with self.subTest(exception=type(failure).__name__):
+                delivery = AsyncMock(return_value=0)
+                discovery = AsyncMock(return_value=0)
+                self.resolver.ensure_source_identity.reset_mock(side_effect=True)
+                self.resolver.ensure_source_identity.side_effect = failure
+
+                with (
+                    patch.object(self.scheduler, "process_due_deliveries", delivery),
+                    patch.object(self.scheduler, "discover_events", discovery),
+                    self.assertRaises(type(failure)),
+                ):
+                    await self.scheduler.run()
+
+                delivery.assert_not_awaited()
+                discovery.assert_not_awaited()
+
+    async def test_run_propagates_identity_check_cancellation_before_any_phase(self) -> None:
+        delivery = AsyncMock(return_value=0)
+        discovery = AsyncMock(return_value=0)
+        self.resolver.ensure_source_identity.side_effect = asyncio.CancelledError
+
+        with (
+            patch.object(self.scheduler, "process_due_deliveries", delivery),
+            patch.object(self.scheduler, "discover_events", discovery),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await self.scheduler.run()
+
+        delivery.assert_not_awaited()
+        discovery.assert_not_awaited()
+
+    async def test_group_unavailability_still_processes_existing_pending_delivery(self) -> None:
+        await self.seed_delivery()
+        self.resolver.ensure_group.return_value = None
+        self.scheduler.sleep = AsyncMock(side_effect=asyncio.CancelledError)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await self.scheduler.run()
+
+        self.bot.send_message.assert_awaited_once()
+        self.service.fetch_schedule.assert_not_awaited()
+        self.assertEqual((await self.deliveries())[0].status, DeliveryStatus.SENT.value)
+
+    async def test_transient_startup_refresh_waits_before_retry_and_preserves_delivery(
+        self,
+    ) -> None:
+        await self.seed_delivery()
+        wait_started = asyncio.Event()
+        release_wait = asyncio.Event()
+        discovery = AsyncMock(side_effect=asyncio.CancelledError)
+        self.resolver.ensure_group.side_effect = [
+            OperationalError("group state", {}, Exception("simulated")),
+            "3.2",
+        ]
+
+        async def controlled_wait(delay: float) -> None:
+            self.assertEqual(delay, self.scheduler.poll_interval)
+            wait_started.set()
+            await release_wait.wait()
+
+        self.scheduler.sleep = controlled_wait
+        with (
+            patch.object(self.scheduler, "discover_events", discovery),
+            self.assertLogs("src.poweron.scheduler", level="ERROR") as logs,
+        ):
+            task = asyncio.create_task(self.scheduler.run())
+            await wait_started.wait()
+            self.assertEqual(self.resolver.ensure_group.await_count, 1)
+            self.assertEqual((await self.deliveries())[0].status, DeliveryStatus.SENT.value)
+            discovery.assert_not_awaited()
+            release_wait.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(self.resolver.ensure_group.await_count, 2)
+        discovery.assert_awaited_once_with()
+        self.assertIn("Startup group refresh failed", "\n".join(logs.output))
+
+    async def test_cancellation_during_startup_retry_wait_propagates(self) -> None:
+        wait_started = asyncio.Event()
+        self.resolver.ensure_group.side_effect = OperationalError(
+            "group state", {}, Exception("simulated")
+        )
+
+        async def controlled_wait(_delay: float) -> None:
+            wait_started.set()
+            await asyncio.Event().wait()
+
+        self.scheduler.sleep = controlled_wait
+        with self.assertLogs("src.poweron.scheduler", level="ERROR"):
+            task = asyncio.create_task(self.scheduler.run())
+            await wait_started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=0.2)
+
+        self.assertEqual(self.resolver.ensure_group.await_count, 1)
+
+    async def test_fatal_startup_phase_failures_escape_before_later_phases(self) -> None:
+        failures = (
+            IntegrityError("startup", {}, Exception("integrity")),
+            ProgrammingError("startup", {}, Exception("programming")),
+            InvalidRequestError("invalid request"),
+            ArgumentError("invalid argument"),
+            PendingRollbackError("pending rollback"),
+            RuntimeError("unexpected local failure"),
+        )
+
+        for failure in failures:
+            with self.subTest(exception=type(failure).__name__):
+                delivery = AsyncMock(return_value=0)
+                discovery = AsyncMock(return_value=0)
+                self.resolver.ensure_group.reset_mock(side_effect=True)
+                self.resolver.ensure_group.side_effect = failure
+
+                with (
+                    patch.object(self.scheduler, "process_due_deliveries", delivery),
+                    patch.object(self.scheduler, "discover_events", discovery),
+                    self.assertRaises(type(failure)),
+                ):
+                    await self.scheduler.run()
+
+                delivery.assert_not_awaited()
+                discovery.assert_not_awaited()
 
     async def test_startup_scan_failure_is_retried_without_stopping_scheduler(self) -> None:
         scan = AsyncMock(
@@ -931,21 +1618,22 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scan.await_count, 3)
         self.assertEqual(discovery.await_count, 2)
 
-    async def test_discovery_failure_does_not_prevent_later_iteration(self) -> None:
+    async def test_unexpected_discovery_failure_is_fatal(self) -> None:
         scan = AsyncMock(return_value=0)
-        discovery = AsyncMock(side_effect=[RuntimeError("bad payload"), 0])
-        controlled_sleep = AsyncMock(side_effect=[None, asyncio.CancelledError])
+        discovery = AsyncMock(side_effect=RuntimeError("bad payload"))
+        controlled_sleep = AsyncMock()
 
         with (
             patch.object(self.scheduler, "process_due_deliveries", scan),
             patch.object(self.scheduler, "discover_events", discovery),
             patch.object(self.scheduler, "sleep", controlled_sleep),
-            self.assertRaises(asyncio.CancelledError),
+            self.assertRaisesRegex(RuntimeError, "bad payload"),
         ):
             await self.scheduler.run()
 
-        self.assertEqual(discovery.await_count, 2)
-        self.assertEqual(scan.await_count, 3)
+        discovery.assert_awaited_once_with()
+        scan.assert_awaited_once_with()
+        controlled_sleep.assert_not_awaited()
 
     async def test_run_propagates_cancellation_from_active_phase_promptly(self) -> None:
         started = asyncio.Event()
