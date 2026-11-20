@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -55,6 +56,7 @@ class UsableScheduleEvent:
     date_graph: str
     event_date: calendar_date
     group_times: dict[str, dict[str, str]]
+    snapshot_hash: str
 
 
 @dataclass(frozen=True)
@@ -227,6 +229,24 @@ class PowerService:
         # incorrectly move historical payloads to an adjacent Kyiv calendar day.
         return parsed.date() if parsed is not None else None
 
+    @staticmethod
+    def compute_snapshot_hash(
+        date_graph: str,
+        group_times: dict[str, dict[str, str]],
+    ) -> str:
+        """Fingerprint the schedule content, independent of upstream event metadata.
+
+        poweron can revise an existing event in place while keeping its id. Hashing
+        the actual times lets the scheduler notice such revisions and notify users.
+        """
+        canonical = json.dumps(
+            {"date_graph": date_graph, "groups": group_times},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
     @classmethod
     def usable_event(
         cls,
@@ -262,6 +282,7 @@ class PowerService:
             date_graph=event.date_graph,
             event_date=event_date,
             group_times=group_times,
+            snapshot_hash=cls.compute_snapshot_hash(event.date_graph, group_times),
         )
 
     @staticmethod

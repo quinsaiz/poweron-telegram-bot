@@ -901,11 +901,12 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🔴 Немає світла", delivery.message)
         self.assertIn("🟡 Перемикання", delivery.message)
 
-    async def test_processed_event_refreshes_cache_without_duplicate_delivery(self) -> None:
+    async def test_processed_event_with_identical_snapshot_refreshes_cache_without_delivery(
+        self,
+    ) -> None:
         await self.add_users((10, "3.2"))
-        self.fetch_schedule_mock.return_value = self.response(
-            self.event(1, {"3.2": {"00:00": "0"}})
-        )
+        times = {"00:00": "1"}
+        self.fetch_schedule_mock.return_value = self.response(self.event(1, {"3.2": times}))
         await self.scheduler.discover_events()
         original_delivery = (await self.deliveries())[0]
         original_snapshot = (
@@ -913,6 +914,10 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             original_delivery.event_date,
             original_delivery.message,
         )
+        async with self.session() as session, session.begin():
+            cache = (await session.execute(select(ScheduleCache))).scalar_one()
+            cache.times_json = json.dumps({"00:00": "0"})
+            cache.updated_at = self.now
         self.fetch_schedule_mock.return_value = self.response(
             self.event(1, {"3.2": {"00:00": "1"}})
         )
@@ -925,7 +930,72 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             (deliveries[0].recipient_group, deliveries[0].event_date, deliveries[0].message),
             original_snapshot,
         )
-        self.assertEqual(json.loads((await self.caches())[0].times_json), {"00:00": "1"})
+        self.assertEqual(json.loads((await self.caches())[0].times_json), times)
+
+    async def test_same_event_id_with_changed_snapshot_queues_new_delivery(self) -> None:
+        await self.add_users((10, "3.2"))
+        old_times = {"00:00": "0"}
+        new_times = {"00:00": "1"}
+        self.fetch_schedule_mock.return_value = self.response(self.event(1, {"3.2": old_times}))
+        self.assertEqual(await self.scheduler.discover_events(), 1)
+        self.assertEqual(await self.scheduler.process_due_deliveries(), 1)
+
+        old_delivery = (await self.deliveries())[0]
+        old_hash = (await self.events())[0].snapshot_hash
+        self.assertEqual(old_delivery.status, DeliveryStatus.SENT.value)
+        self.assertIsNotNone(old_hash)
+        self.assertIn("🟢 Є світло", old_delivery.message)
+
+        self.fetch_schedule_mock.return_value = self.response(self.event(1, {"3.2": new_times}))
+        self.assertEqual(await self.scheduler.discover_events(), 1)
+
+        delivery = (await self.deliveries())[0]
+        self.assertEqual(delivery.status, DeliveryStatus.PENDING.value)
+        self.assertEqual(delivery.attempt_count, 0)
+        self.assertIn("🔴 Немає світла", delivery.message)
+        revised_hash = (await self.events())[0].snapshot_hash
+        self.assertIsNotNone(revised_hash)
+        self.assertNotEqual(revised_hash, old_hash)
+        self.assertEqual(json.loads((await self.caches())[0].times_json), new_times)
+
+        self.assertEqual(await self.scheduler.process_due_deliveries(), 1)
+        self.assertEqual((await self.deliveries())[0].status, DeliveryStatus.SENT.value)
+
+        self.assertEqual(await self.scheduler.discover_events(), 0)
+        self.assertEqual(len(await self.deliveries()), 1)
+
+    async def test_identical_event_with_reordered_times_is_not_a_revision(self) -> None:
+        await self.add_users((10, "3.2"))
+        self.fetch_schedule_mock.return_value = self.response(
+            self.event(1, {"3.2": {"00:00": "0", "00:30": "1"}})
+        )
+        self.assertEqual(await self.scheduler.discover_events(), 1)
+
+        self.fetch_schedule_mock.return_value = self.response(
+            self.event(1, {"3.2": {"00:30": "1", "00:00": "0"}})
+        )
+
+        self.assertEqual(await self.scheduler.discover_events(), 0)
+        self.assertEqual(len(await self.deliveries()), 1)
+
+    async def test_legacy_event_without_snapshot_hash_is_notified_once(self) -> None:
+        await self.add_users((10, "3.2"))
+        await self.seed_delivery(event_id=1, add_user=False)
+        self.fetch_schedule_mock.return_value = self.response(
+            self.event(1, {"3.2": {"00:00": "1"}})
+        )
+
+        self.assertEqual(await self.scheduler.discover_events(), 1)
+
+        event = (await self.events())[0]
+        self.assertIsNotNone(event.snapshot_hash)
+        delivery = (await self.deliveries())[0]
+        self.assertNotEqual(delivery.message, "message-10")
+        self.assertIn("🔴 Немає світла", delivery.message)
+        self.assertEqual(delivery.status, DeliveryStatus.PENDING.value)
+
+        self.assertEqual(await self.scheduler.discover_events(), 0)
+        self.assertEqual(len(await self.deliveries()), 1)
 
     async def test_persistence_failure_does_not_attempt_cache_upsert(self) -> None:
         await self.add_users((10, "3.2"))

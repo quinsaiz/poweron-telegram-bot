@@ -5,8 +5,10 @@ delivery. ``attempt_count`` counts every completed Telegram call, whether it suc
 returns a recoverable/terminal error; a fifth recoverable result becomes ``exhausted``.
 Exactly-once delivery is impossible: Telegram may accept a message immediately before the
 process exits and before SQLite records success. That narrow crash window can produce a
-duplicate after restart; all ordinary completed deliveries are unique by
-``(event_id, chat_id)`` and are never selected again.
+duplicate after restart. Within one schedule snapshot, completed deliveries are unique by
+``(event_id, chat_id)`` and are never selected again. An upstream schedule revision reuses
+the event id but replaces its delivery rows, so every revision is delivered at least once
+to the current subscribers.
 """
 
 from __future__ import annotations
@@ -321,6 +323,58 @@ class ScheduleScheduler:
             accepted.append(first)
         return accepted
 
+    async def _persist_existing_event(
+        self,
+        session: AsyncSession,
+        existing: ProcessedScheduleEvent,
+        usable: UsableScheduleEvent,
+        recipient_group: str,
+        deliveries: list[NotificationDelivery],
+    ) -> EventPersistenceResult:
+        if existing.date_graph != usable.date_graph:
+            logger.warning(
+                "Existing schedule event id=%s has incompatible dateGraph; cache unchanged",
+                usable.event_id,
+            )
+            return EventPersistenceResult.EXISTING_INCOMPATIBLE
+
+        # poweron may rewrite the schedule behind the same event id.
+        # A changed fingerprint is a new revision that users must see.
+        # Legacy rows have no fingerprint and are treated as changed once,
+        # so a revision made during the upgrade is not swallowed.
+        snapshot_changed = existing.snapshot_hash != usable.snapshot_hash
+        if not snapshot_changed:
+            matching_delivery = await session.execute(
+                select(NotificationDelivery.id)
+                .where(
+                    NotificationDelivery.event_id == usable.event_id,
+                    NotificationDelivery.recipient_group == recipient_group,
+                )
+                .limit(1)
+            )
+            if matching_delivery.scalar_one_or_none() is not None:
+                return EventPersistenceResult.EXISTING_COMPATIBLE
+
+        if snapshot_changed:
+            existing.snapshot_hash = usable.snapshot_hash
+            logger.info(
+                "Schedule event id=%s was revised; queueing new deliveries",
+                usable.event_id,
+            )
+
+        if deliveries:
+            await session.execute(
+                delete(NotificationDelivery).where(NotificationDelivery.event_id == usable.event_id)
+            )
+            session.add_all(deliveries)
+            return EventPersistenceResult.CREATED
+
+        if snapshot_changed:
+            await session.execute(
+                delete(NotificationDelivery).where(NotificationDelivery.event_id == usable.event_id)
+            )
+        return EventPersistenceResult.EXISTING_COMPATIBLE
+
     async def _persist_event(
         self,
         prepared: PreparedEvent,
@@ -364,38 +418,18 @@ class ScheduleScheduler:
                     return EventPersistenceResult.STALE_AUTHORITY
                 existing = await session.get(ProcessedScheduleEvent, usable.event_id)
                 if existing is not None:
-                    if existing.date_graph != usable.date_graph:
-                        logger.warning(
-                            "Existing schedule event id=%s has incompatible dateGraph; "
-                            "cache unchanged",
-                            usable.event_id,
-                        )
-                        return EventPersistenceResult.EXISTING_INCOMPATIBLE
-                    matching_delivery = await session.execute(
-                        select(NotificationDelivery.id)
-                        .where(
-                            NotificationDelivery.event_id == usable.event_id,
-                            NotificationDelivery.recipient_group == recipient_group,
-                        )
-                        .limit(1)
+                    return await self._persist_existing_event(
+                        session,
+                        existing,
+                        usable,
+                        recipient_group,
+                        deliveries,
                     )
-                    if matching_delivery.scalar_one_or_none() is not None:
-                        return EventPersistenceResult.EXISTING_COMPATIBLE
-
-                    if users:
-                        await session.execute(
-                            delete(NotificationDelivery).where(
-                                NotificationDelivery.event_id == usable.event_id
-                            )
-                        )
-                        session.add_all(deliveries)
-                        return EventPersistenceResult.CREATED
-
-                    return EventPersistenceResult.EXISTING_COMPATIBLE
                 session.add(
                     ProcessedScheduleEvent(
                         event_id=usable.event_id,
                         date_graph=usable.date_graph,
+                        snapshot_hash=usable.snapshot_hash,
                         created_at=discovered_at,
                     )
                 )

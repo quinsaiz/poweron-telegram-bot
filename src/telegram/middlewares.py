@@ -1,7 +1,7 @@
 import time
 from collections.abc import Awaitable, Callable  # noqa: TC003  # runtime annotation reflection
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from aiogram import BaseMiddleware
 from aiogram.types import Message, TelegramObject

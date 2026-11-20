@@ -39,7 +39,8 @@ with patch.dict(
     from src.poweron import service as service_module
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-HEAD_REVISION = "20260925_initial_schema"
+HEAD_REVISION = "20261120_02_event_snapshot_hash"
+INITIAL_REVISION = "20260925_initial_schema"
 MIGRATIONS_ROOT = PROJECT_ROOT / "migrations"
 VERSIONS_ROOT = MIGRATIONS_ROOT / "versions"
 
@@ -103,12 +104,16 @@ class StandardAlembicTests(unittest.TestCase):
         assert isinstance(revision, str)
         return revision
 
-    def test_exactly_one_head_and_one_revision(self) -> None:
+    def test_single_head_and_linear_revision_history(self) -> None:
         script = ScriptDirectory.from_config(Config(str(PROJECT_ROOT / "alembic.ini")))
         self.assertEqual(script.get_heads(), [HEAD_REVISION])
         revisions = list(script.walk_revisions())
-        self.assertEqual(len(revisions), 1)
-        self.assertIsNone(revisions[0].down_revision)
+        self.assertEqual(
+            [revision.revision for revision in revisions],
+            [HEAD_REVISION, INITIAL_REVISION],
+        )
+        self.assertIsNone(revisions[-1].down_revision)
+        self.assertEqual(revisions[0].down_revision, revisions[-1].revision)
 
     def test_fresh_database_upgrades_from_base_to_head(self) -> None:
         self.upgrade()
@@ -224,6 +229,30 @@ class StandardAlembicTests(unittest.TestCase):
                         if isinstance(index, Index)
                     },
                 )
+
+    def test_snapshot_hash_migration_preserves_existing_events(self) -> None:
+        result = run_alembic(self.url, "upgrade", INITIAL_REVISION)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with self.engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO processed_schedule_events (event_id, date_graph, created_at) "
+                    "VALUES ('47', '2026-11-20T00:00:00Z', '2026-11-20 09:27:00')"
+                )
+            )
+
+        self.upgrade()
+
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT event_id, date_graph, snapshot_hash "
+                    "FROM processed_schedule_events WHERE event_id = '47'"
+                )
+            ).one()
+        self.assertEqual(row.event_id, "47")
+        self.assertEqual(row.date_graph, "2026-11-20T00:00:00Z")
+        self.assertIsNone(row.snapshot_hash)
 
     def test_schedule_cache_has_only_composite_unique_constraint(self) -> None:
         self.upgrade()
