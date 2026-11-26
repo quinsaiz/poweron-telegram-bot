@@ -4,6 +4,7 @@ from aiogram import F, Router, types
 from aiogram.filters import Command
 from sqlalchemy import select
 
+from src.config import settings
 from src.database.engine import async_session
 from src.database.models import User
 from src.domain_time import kyiv_now
@@ -11,6 +12,14 @@ from src.poweron.service import PowerService
 from src.telegram.utils import get_main_keyboard
 
 router = Router()
+
+
+def _refresh_interval_text(seconds: int) -> str:
+    if seconds == 60:
+        return "щохвилини"
+    if seconds % 60 == 0:
+        return f"кожні {seconds // 60} хв"
+    return f"кожні {seconds} с"
 
 
 @router.message(Command("start"))
@@ -60,7 +69,8 @@ async def cmd_help(message: types.Message) -> None:
         "🟢 Світло є\n"
         "🔴 Немає світла\n"
         "🟡 Перемикання\n\n"
-        "💡 Графіки оновлюються автоматично кожні 10 хвилин",
+        "💡 Графіки оновлюються автоматично "
+        f"{_refresh_interval_text(settings.POWERON_POLL_INTERVAL_SECONDS)}",
         parse_mode="Markdown",
     )
 

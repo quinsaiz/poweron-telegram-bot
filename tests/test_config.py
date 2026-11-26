@@ -32,6 +32,7 @@ class SettingsTests(unittest.TestCase):
         BOT_TOKEN: str = "123:test-only-token",
         POWERON_CITY_ID: int = 21005,
         POWERON_API_URL: str = "https://api-poweron.toe.com.ua/api/",
+        POWERON_POLL_INTERVAL_SECONDS: int = 60,
         LOG_LEVEL: str = "INFO",
     ) -> Settings:
         return Settings(
@@ -39,6 +40,7 @@ class SettingsTests(unittest.TestCase):
             BOT_TOKEN=BOT_TOKEN,
             POWERON_CITY_ID=POWERON_CITY_ID,
             POWERON_API_URL=POWERON_API_URL,
+            POWERON_POLL_INTERVAL_SECONDS=POWERON_POLL_INTERVAL_SECONDS,
             LOG_LEVEL=LOG_LEVEL,
         )
 
@@ -53,6 +55,15 @@ class SettingsTests(unittest.TestCase):
         for city_id in (0, -1):
             with self.subTest(city_id=city_id), self.assertRaises(ValidationError):
                 self.settings(POWERON_CITY_ID=city_id)
+
+    def test_poll_interval_defaults_to_one_minute_and_must_be_positive(self) -> None:
+        self.assertEqual(
+            Settings.model_fields["POWERON_POLL_INTERVAL_SECONDS"].default,
+            60,
+        )
+        for interval in (0, -1):
+            with self.subTest(interval=interval), self.assertRaises(ValidationError):
+                self.settings(POWERON_POLL_INTERVAL_SECONDS=interval)
 
     def test_api_url_accepts_only_canonical_api_roots(self) -> None:
         accepted = (

@@ -62,6 +62,7 @@ class Settings(DatabaseSettings):
     BOT_TOKEN: SecretStr = Field(min_length=1)
     POWERON_CITY_ID: int = Field(gt=0)
     POWERON_API_URL: str
+    POWERON_POLL_INTERVAL_SECONDS: int = Field(default=60, ge=1)
 
     LOG_LEVEL: str = "INFO"
 

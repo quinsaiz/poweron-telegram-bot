@@ -55,6 +55,7 @@ with patch.dict(
         "POWERON_API_URL": "https://api-poweron.toe.com.ua/api",
     },
 ):
+    from src.config import settings
     from src.database import source_state as source_state_module
     from src.database.engine import configure_sqlite_foreign_keys
     from src.database.models import (
@@ -67,6 +68,7 @@ with patch.dict(
     )
     from src.poweron.groups import GroupRefreshResult, PowerOnGroupResolver, SourceIdentityError
     from src.poweron.scheduler import (
+        STARTUP_RETRY_INTERVAL_SECONDS,
         DeliveryStatus,
         EventPersistenceResult,
         PreparedEvent,
@@ -296,6 +298,11 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.scheduler.discover_events(), 0)
         self.assertEqual(await self.events(), [])
         self.assertEqual(await self.deliveries(), [])
+
+    async def test_default_poll_and_retry_intervals(self) -> None:
+        self.assertEqual(self.scheduler.poll_interval, settings.POWERON_POLL_INTERVAL_SECONDS)
+        self.assertEqual(self.scheduler.retry_interval, STARTUP_RETRY_INTERVAL_SECONDS)
+        self.assertEqual(STARTUP_RETRY_INTERVAL_SECONDS, 60)
 
     async def test_expected_poweron_failures_retry_only_on_next_iteration(self) -> None:
         await self.add_cache(times={"00:00": "10"})
@@ -1510,7 +1517,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             await self.scheduler.run()
 
         self.assertEqual(self.ensure_source_identity_mock.await_count, 2)
-        self.scheduler.sleep.assert_awaited_once_with(self.scheduler.poll_interval)
+        self.scheduler.sleep.assert_awaited_once_with(self.scheduler.retry_interval)
         delivery.assert_awaited_once_with()
         discovery.assert_awaited_once_with()
         self.assertIn("source identity check failed", "\n".join(logs.output))
@@ -1548,7 +1555,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
             await self.scheduler.run()
 
         self.assertEqual(self.ensure_source_identity_mock.await_count, 2)
-        self.scheduler.sleep.assert_awaited_once_with(self.scheduler.poll_interval)
+        self.scheduler.sleep.assert_awaited_once_with(self.scheduler.retry_interval)
         delivery.assert_awaited_once_with()
         discovery.assert_awaited_once_with()
 
@@ -1618,7 +1625,7 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         async def controlled_wait(delay: float) -> None:
-            self.assertEqual(delay, self.scheduler.poll_interval)
+            self.assertEqual(delay, self.scheduler.retry_interval)
             wait_started.set()
             await release_wait.wait()
 
@@ -1639,6 +1646,35 @@ class SchedulerOutboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ensure_group_mock.await_count, 2)
         discovery.assert_awaited_once_with()
         self.assertIn("Startup group refresh failed", "\n".join(logs.output))
+
+    async def test_run_uses_retry_interval_for_startup_and_poll_interval_for_main_loop(
+        self,
+    ) -> None:
+        scan = AsyncMock(return_value=0)
+        discovery = AsyncMock(return_value=0)
+        delays: list[float] = []
+
+        async def controlled_sleep(delay: float) -> None:
+            delays.append(delay)
+            if len(delays) == 2:
+                raise asyncio.CancelledError
+
+        self.ensure_group_mock.side_effect = [
+            OperationalError("group state", {}, Exception("simulated")),
+            GroupRefreshResult(group="3.2", previous_group="3.2"),
+        ]
+        with (
+            patch.object(self.scheduler, "process_due_deliveries", scan),
+            patch.object(self.scheduler, "discover_events", discovery),
+            patch.object(self.scheduler, "sleep", controlled_sleep),
+            self.assertLogs("src.poweron.scheduler", level="ERROR"),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await self.scheduler.run()
+
+        self.assertEqual(delays, [self.scheduler.retry_interval, self.scheduler.poll_interval])
+        self.assertEqual(scan.await_count, 2)
+        discovery.assert_awaited_once_with()
 
     async def test_cancellation_during_startup_retry_wait_propagates(self) -> None:
         wait_started = asyncio.Event()

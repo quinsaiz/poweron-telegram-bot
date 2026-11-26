@@ -56,7 +56,8 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__, settings.LOG_LEVEL)
 
-POLL_INTERVAL_SECONDS = 600
+POLL_INTERVAL_SECONDS = settings.POWERON_POLL_INTERVAL_SECONDS
+STARTUP_RETRY_INTERVAL_SECONDS = 60
 MAX_TRANSIENT_ATTEMPTS = 5
 BASE_BACKOFF_SECONDS = 60
 MAX_BACKOFF_SECONDS = 3600
@@ -132,6 +133,7 @@ class ScheduleScheduler:
         session_factory: async_sessionmaker[AsyncSession] | None = None,
         clock: Callable[[], datetime] = utc_now,
         poll_interval: float = POLL_INTERVAL_SECONDS,
+        retry_interval: float = STARTUP_RETRY_INTERVAL_SECONDS,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.bot = bot
@@ -139,6 +141,7 @@ class ScheduleScheduler:
         self.session_factory = session_factory or async_session
         self.clock = clock
         self.poll_interval = poll_interval
+        self.retry_interval = retry_interval
         self.sleep = sleep
         self._discovery_lock = asyncio.Lock()
         self._delivery_lock = asyncio.Lock()
@@ -714,7 +717,7 @@ class ScheduleScheduler:
             if not delivery_scanned:
                 await self._run_phase("Startup delivery scan", self.process_due_deliveries)
                 delivery_scanned = True
-            await self.sleep(self.poll_interval)
+            await self.sleep(self.retry_interval)
             return False, delivery_scanned
 
         if refresh_state is StartupGroupRefreshState.NOT_ATTEMPTED:
@@ -725,7 +728,7 @@ class ScheduleScheduler:
                 await self._run_phase("Startup delivery scan", self.process_due_deliveries)
                 delivery_scanned = True
             if not refresh_succeeded:
-                await self.sleep(self.poll_interval)
+                await self.sleep(self.retry_interval)
                 return False, delivery_scanned
         elif refresh_state is not StartupGroupRefreshState.SUCCEEDED:
             assert_never(refresh_state)
@@ -748,7 +751,7 @@ class ScheduleScheduler:
             if not identity_confirmed:
                 identity_confirmed = await self._confirm_source_identity()
                 if not identity_confirmed:
-                    await self.sleep(self.poll_interval)
+                    await self.sleep(self.retry_interval)
                     continue
             if not startup_phases_complete:
                 (

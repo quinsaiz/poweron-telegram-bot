@@ -37,6 +37,12 @@ class TelegramHandlerTests(unittest.IsolatedAsyncioTestCase):
         async with self.session() as session:
             return list((await session.execute(select(User))).scalars().all())
 
+    async def test_help_reports_configured_poll_interval(self) -> None:
+        with patch.object(handlers.settings, "POWERON_POLL_INTERVAL_SECONDS", 60):
+            await handlers.cmd_help(self.message)
+
+        self.assertIn("щохвилини", self.message.answer.await_args.args[0])
+
     async def test_start_creates_user_and_reports_discovered_group(self) -> None:
         resolver = SimpleNamespace(ensure_group=AsyncMock(return_value="2.2"))
         service = SimpleNamespace(group_resolver=resolver)
