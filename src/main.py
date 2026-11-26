@@ -21,7 +21,7 @@ from src.telegram.handlers import router as telegram_router
 from src.telegram.middlewares import AntiFloodMiddleware
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Coroutine
+    from collections.abc import AsyncGenerator, Coroutine
 
 logger = setup_logger(__name__, settings.LOG_LEVEL)
 
@@ -330,7 +330,7 @@ async def _shutdown(
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+async def lifespan(_: FastAPI) -> AsyncGenerator[None]:
     runtime_health = RuntimeHealth()
     _.state.runtime_health = runtime_health
     polling_task = None

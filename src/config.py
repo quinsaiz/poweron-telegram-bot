@@ -113,4 +113,4 @@ class Settings(DatabaseSettings):
         return normalized
 
 
-settings = Settings()
+settings = Settings()  # pyright: ignore[reportCallIssue]

@@ -523,8 +523,6 @@ class ScheduleScheduler:
                     pass
                 case EventPersistenceResult.STALE_AUTHORITY:
                     return persisted
-                case _ as unreachable:
-                    assert_never(unreachable)
         await self._refresh_cache(cacheable, discovered_at, city_id, group)
         return persisted
 

@@ -46,7 +46,7 @@ def get_current_status(times: dict[str, str], *, now: datetime | None = None) ->
     sorted_times = sorted(times.items())
     current_status = None
 
-    for i, (time, status) in enumerate(sorted_times):
+    for _, (time, status) in enumerate(sorted_times):
         if current_time >= time:
             current_status = status
         else:

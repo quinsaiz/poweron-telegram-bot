@@ -214,10 +214,7 @@ class PowerService:
     @staticmethod
     def valid_times(times: dict[str, str]) -> bool:
         return bool(times) and all(
-            isinstance(time, str)
-            and TIME_PATTERN.fullmatch(time) is not None
-            and isinstance(status, str)
-            and status in VALID_STATUSES
+            TIME_PATTERN.fullmatch(time) is not None and status in VALID_STATUSES
             for time, status in times.items()
         )
 
