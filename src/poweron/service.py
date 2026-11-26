@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from datetime import date as calendar_date
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 import httpx
@@ -125,7 +126,7 @@ class PowerService:
                 time_diff = (utc_now() - cache_time).total_seconds()
 
                 if time_diff >= 1800 and not allow_stale:
-                    logger.info(f"Cache EXPIRED for {date_str} (age: {int(time_diff)}s)")
+                    logger.debug(f"Cache EXPIRED for {date_str} (age: {int(time_diff)}s)")
                     return None, None
 
                 try:
@@ -137,7 +138,7 @@ class PowerService:
                 if not isinstance(times, dict) or not times:
                     return None, None
 
-                logger.info(f"Cache HIT for {date_str} (age: {int(time_diff)}s)")
+                logger.debug(f"Cache HIT for {date_str} (age: {int(time_diff)}s)")
                 return times, cache_time
 
             return None, None
@@ -187,7 +188,7 @@ class PowerService:
                 await session.rollback()
                 raise
 
-            logger.info("Cache saved for %s, group %s", date_str, group)
+            logger.debug("Cache saved for %s, group %s", date_str, group)
 
     @classmethod
     async def save_authoritative_schedule_to_cache(
@@ -208,7 +209,7 @@ class PowerService:
                 return False
             await cls.upsert_schedule_cache(session, date_str, group, times_dict, utc_now())
 
-        logger.info("Cache saved for %s, group %s", date_str, group)
+        logger.debug("Cache saved for %s, group %s", date_str, group)
         return True
 
     @staticmethod
@@ -347,12 +348,20 @@ class PowerService:
             ("time", settings.POWERON_CITY_ID),
         ]
 
+        started_at = perf_counter()
+
         async with httpx.AsyncClient(
             headers=self.headers,
             follow_redirects=True,
             timeout=30.0,
         ) as client:
             response = await client.get(self.schedule_url, params=params)
+
+        logger.debug(
+            "Poweron API request completed: status=%s duration=%.3fs",
+            response.status_code,
+            perf_counter() - started_at,
+        )
 
         if response.status_code != 200:
             logger.error("poweron schedule request failed with status %s", response.status_code)
@@ -425,6 +434,8 @@ class PowerService:
         cached_times, updated_at = await self.get_schedule_from_cache(date_str, user_group)
 
         if cached_times is None:
+            started_at = perf_counter()
+
             try:
                 await self.get_schedule(group=user_group, date=date)
             except (
@@ -435,6 +446,12 @@ class PowerService:
                 StaleDataError,
             ) as exc:
                 logger.warning(f"Could not refresh schedule for {date_str}: {exc}")
+
+            logger.debug(
+                "Schedule refresh completed: date=%s duration=%.3fs",
+                date_str,
+                perf_counter() - started_at,
+            )
 
             cached_times, updated_at = await self.get_schedule_from_cache(date_str, user_group)
             if cached_times is None:

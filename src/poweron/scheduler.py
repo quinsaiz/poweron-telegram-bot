@@ -249,7 +249,20 @@ class ScheduleScheduler:
     ) -> PreparedEvent | None:
         usable = self.service.usable_event(event, {group}, relevant_dates)
         if usable is None:
-            logger.warning("Ignoring unusable schedule event id=%s", event.id)
+            event_date = self.service.parse_event_date(event.date_graph)
+            if event_date is not None and event_date not in relevant_dates:
+                logger.debug(
+                    "Skipping schedule event id=%s: date %s is outside relevant dates",
+                    event.id,
+                    event_date,
+                )
+            else:
+                logger.warning(
+                    "Ignoring unusable schedule event id=%s date_graph=%s group_present=%s",
+                    event.id,
+                    event.date_graph,
+                    isinstance(event.data_json, dict) and group in event.data_json,
+                )
             return None
 
         messages: dict[str, str] = {}
@@ -497,7 +510,7 @@ class ScheduleScheduler:
         group: str,
     ) -> int:
         if fetch.response is None or not fetch.response.events:
-            logger.info("The schedule is empty or unavailable.")
+            logger.debug("The schedule is empty or unavailable.")
             return 0
 
         users = await self._load_users()
@@ -762,7 +775,7 @@ class ScheduleScheduler:
                 startup_group_refresh_state = StartupGroupRefreshState.NOT_ATTEMPTED
                 if not startup_phases_complete:
                     continue
-            logger.info("Checking for schedule updates...")
+            logger.debug("Checking for schedule updates...")
             await self._run_phase("Schedule discovery", self.discover_events)
             await self._run_phase("Post-discovery delivery scan", self.process_due_deliveries)
             await self.sleep(self.poll_interval)
