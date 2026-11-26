@@ -3,15 +3,15 @@ name = "poweron-telegram-bot"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
-    "aiogram==3.25.0",
+    "aiogram==3.34.0",
     "aiosqlite==0.22.1",
-    "alembic==1.20.0",
-    "fastapi==0.129.0",
+    "alembic==1.20.1",
+    "fastapi==0.165.0",
     "httpx==0.28.1",
-    "pydantic==2.12.5",
-    "pydantic-settings==2.12.0",
-    "sqlalchemy==2.0.46",
-    "uvicorn==0.40.0",
+    "pydantic==2.14.4",
+    "pydantic-settings==2.16.3",
+    "sqlalchemy[asyncio]>=2.1.9",
+    "uvicorn==0.54.0",
 ]
 
 [dependency-groups]
